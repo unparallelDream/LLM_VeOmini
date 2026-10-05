@@ -1,0 +1,26 @@
+**/__pycache__/**
+**.pyc
+nohup.*
+wandb/*
+*.out
+*.log
+*.txt
+!requirements.txt
+**/logs/**
+**/speed/**
+**/devcodebook/**
+.claude/**
+.cache/**
+.cache/dataset_size.json
+tmp/
+icl_inference_output/
+scripts/eval/regression_345m_hils_ppl_generate.sh
+scripts/eval/regression_345m_ppl_parallel.sh
+scripts/eval/eval_olmo3_opencompass_test.sh
+scripts/cpt/test_outputs/
+cpt_olmo3_8KA2K_HoPE_qcal_test.sh
+# local artifacts
+**/tmp/**
+.pytest_cache/**
+**/trace/**
+**/*.distcp

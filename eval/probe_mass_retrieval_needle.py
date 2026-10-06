@@ -339,6 +339,13 @@ def main():
             ns.checkpoint = str(ANCHOR_RUN / f"global_step_{step}_anchor_only")
             model, _meta = evalmod.load_mass_model(ns, fixed_anchor_zero=False)
             return model
+        if name.startswith("noshared06"):
+            step = name[len("noshared06"):]
+            ns.mass_config = "configs/mass_attention/config_mass_qwen3_0p6B_8KA2K_RoPE_m2_r8_asym0p5_anneal.json"
+            ns.mass_model = "/9950backfile/zhangem/.cache/modelscope/models/Qwen--Qwen3-0.6B-MASS-m2/snapshots/master"
+            ns.checkpoint = str(Path("/9950backfile/zhangem/outputs/mass_lora_qwen3_0p6b_anchor_noshared_newproto_ft20000/checkpoints") / f"global_step_{step}")
+            model, _meta = evalmod.load_mass_lora_model(ns)
+            return model
         if name.startswith("noshared90m"):
             step = name[len("noshared90m"):]
             ns.mass_config = "configs/mass_attention/config_mass_qwen3_90M_8KA2K_RoPE_m2_r8_asym0p5_anneal.json"

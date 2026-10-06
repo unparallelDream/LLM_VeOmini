@@ -16,6 +16,7 @@ from models.FlashHiLS.modeling_olmo_hils import (
 
 from .mass_attention import MASSAttention
 from .mass_index import MultiTangentAnchorGenerator
+from .modeling_qwen_mass import MASSForCausalLM as QwenMASSForCausalLM
 from .modeling_qwen_mass import (
     MASSForCausalLM as QwenMASSForCausalLM,
     mass_index_config_from_model_config,
@@ -137,12 +138,88 @@ class MASSForCausalLM(HiLSForCausalLM):
         if config.tie_word_embeddings:
             self.tie_weights()
 
+    def _build_needle_ctx(self, input_ids):
+        """Locate RULER needles in RAW input ids and build the NCI context.
+
+        The needle phrase never occurs in natural fineweb text, so a simple
+        token-subsequence match is enough.  Positions are converted to
+        expanded coordinates (r + r//63) and 63-token chunk ids here; the
+        retrieval layers only see expanded tensors.
+        """
+        pattern = getattr(self.model, "_mass_needle_pattern", None)
+        if pattern is None or input_ids is None or input_ids.dim() != 2:
+            return None
+        chunk_size = int(getattr(self.config, "chunk_size", 64) or 64)
+        real = chunk_size - 1
+        pattern = pattern.to(input_ids.device)
+        B, L = input_ids.shape
+        if pattern.numel() < 2 or L <= pattern.numel():
+            return None
+        n_query = int(os.environ.get("MASS_NCI_QUERY_ROWS", "64"))
+        raw_rows = torch.arange(max(0, L - n_query), L, device=input_ids.device)
+        rows_exp = raw_rows + torch.div(raw_rows, real, rounding_mode="floor")
+        windows = input_ids.unfold(1, pattern.numel(), 1)
+        matches = (windows == pattern[None, None, :]).all(dim=-1)  # [B, L-P+1]
+        max_needles = int(os.environ.get("MASS_NCI_MAX_NEEDLES", "8"))
+        needle_chunks = torch.full(
+            (B, max_needles), -1, dtype=torch.long, device=input_ids.device
+        )
+        has = torch.zeros(B, dtype=torch.bool, device=input_ids.device)
+        for b in range(B):
+            pos = matches[b].nonzero(as_tuple=True)[0]
+            if pos.numel() == 0:
+                continue
+            pos = pos[:max_needles]
+            needle_chunks[b, : pos.numel()] = torch.div(
+                pos, real, rounding_mode="floor"
+            )
+            has[b] = True
+        if not bool(has.any()):
+            return None
+        return {
+            "rows_exp": rows_exp,
+            "needle_chunks": needle_chunks,
+            "sample_has_needle": has,
+        }
+
     def forward(self, *args, **kwargs):
+        nci_enabled = os.environ.get("MASS_NEEDLE_INFO_NCE", "0") == "1"
+        ctx = None
+        if nci_enabled and torch.is_grad_enabled():
+            input_ids = kwargs.get("input_ids")
+            if input_ids is None and args:
+                input_ids = args[0]
+            ctx = self._build_needle_ctx(input_ids)
+        # Reset per-forward state BEFORE the pass and keep ctx alive until the
+        # next forward: gradient-checkpointing recomputes decoder layers during
+        # backward, and both passes must take the identical code path (a ctx
+        # cleared mid-step makes recomputation save a different number of
+        # tensors and trips CheckpointError).  Terms appended later by the
+        # recompute pass are harmless; they are wiped here at the next entry.
+        for layer_idx in self.model._mass_layer_indices:
+            attn = self.model.layers[int(layer_idx)].self_attn
+            attn._mass_nci_terms = []
+            attn._mass_needle_ctx = ctx
         outputs = super().forward(*args, **kwargs)
+        lm_loss_pure = outputs.loss  # pure LM loss; spec/nci are added below
+        nci_terms = []
+        if nci_enabled:
+            for layer_idx in self.model._mass_layer_indices:
+                attn = self.model.layers[int(layer_idx)].self_attn
+                terms = getattr(attn, "_mass_nci_terms", [])
+                nci_terms.extend(t for t in terms if t is not None)
+        needle_loss = None
+        nci_weight = float(os.environ.get("MASS_NCI_WEIGHT", "1.0"))
+        if nci_terms:
+            needle_loss = torch.stack(nci_terms).mean()
+            if outputs.loss is not None:
+                outputs.loss = outputs.loss + nci_weight * needle_loss
+            outputs.mass_needle_loss = needle_loss
+            outputs.mass_needle_loss_weight = nci_weight
         balance_losses = getattr(self.model, "_mass_balance_losses", ())
         anchor_loads = getattr(self.model, "_mass_anchor_loads", ())
         if balance_losses:
-            lm_loss = outputs.loss
+            lm_loss = lm_loss_pure
             balance_loss = torch.stack(balance_losses).mean()
             anchor_load = torch.stack(anchor_loads)
             balance_weight = float(
@@ -158,6 +235,21 @@ class MASSForCausalLM(HiLSForCausalLM):
                     ),
                 )
             )
+            # MASS_SPEC_WARMUP_STEPS: linear ramp 0 -> balance_weight, driven
+            # by the training loop via model._mass_spec_weight_step, so the
+            # routing differentiation is not locked in before the LM (and any
+            # retrieval supervision) has shaped the summaries.
+            step_weight = getattr(self.model, "_mass_spec_weight_step", None)
+            if step_weight is not None:
+                balance_weight = float(step_weight)
+            if os.environ.get("MASS_SPEC_DIVERSE_MU", "0") == "1":
+                div_losses = [
+                    self.model.layers[int(i)].self_attn.last_mass_diversity_loss
+                    for i in self.model._mass_layer_indices
+                ]
+                div_losses = [d for d in div_losses if d is not None]
+                if div_losses:
+                    balance_loss = torch.stack(div_losses).mean()
             if lm_loss is not None:
                 outputs.loss = lm_loss + balance_weight * balance_loss
             outputs.lm_loss = lm_loss
@@ -168,3 +260,4 @@ class MASSForCausalLM(HiLSForCausalLM):
             outputs.mass_anchor_loads = anchor_load
             outputs.mass_layer_indices = self.model._mass_layer_indices
         return outputs
+

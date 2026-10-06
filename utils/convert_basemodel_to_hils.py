@@ -393,7 +393,7 @@ def main():
     enable_external_lmk_embed = bool(target_config.get("enable_external_lmk_embed", False))
     print(f"[4/5] Creating HiLS model, preparing vocab/lmk weights, and saving...")
     print(f"       enable_external_lmk_embed={enable_external_lmk_embed}")
-    model = build_foundation_model(config_path=args.target_config)
+    model = build_foundation_model(config_path=args.target_config, attn_implementation="sdpa")
 
     model_sd = model.state_dict()
     init_range = target_config.get("initializer_range", 0.02)

@@ -29,7 +29,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="HF dir with model.safetensors (pruned base)")
-    ap.add_argument("--checkpoint", required=True, help="DCP checkpoint dir of the recovery run")
+    ap.add_argument("--checkpoint", required=False, default=None, help="DCP checkpoint dir of the recovery run; omit for zero-shot HF weights")
     ap.add_argument("--tokenizer", required=True)
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--output", required=True)
@@ -49,13 +49,16 @@ def main():
     model.eval()
 
     from veomni.checkpoint import ckpt_to_state_dict
-    sd = ckpt_to_state_dict(args.checkpoint)
-    keep = {k: v for k, v in sd.items() if not k.startswith(("optimizer", "dataloader", "lr_scheduler", "extra"))}
-    incompat = model.load_state_dict(keep, strict=False)
-    loaded = len(keep) - len(incompat.missing_keys)
-    print(f"[load] {loaded} tensors loaded, missing={len(incompat.missing_keys)}, unexpected={len(incompat.unexpected_keys)}")
-    if incompat.unexpected_keys:
-        raise RuntimeError(f"unexpected keys: {incompat.unexpected_keys[:5]}")
+    if args.checkpoint:
+        sd = ckpt_to_state_dict(args.checkpoint)
+        keep = {k: v for k, v in sd.items() if not k.startswith(("optimizer", "dataloader", "lr_scheduler", "extra"))}
+        incompat = model.load_state_dict(keep, strict=False)
+        loaded = len(keep) - len(incompat.missing_keys)
+        print(f"[load] {loaded} tensors loaded, missing={len(incompat.missing_keys)}, unexpected={len(incompat.unexpected_keys)}")
+        if incompat.unexpected_keys:
+            raise RuntimeError(f"unexpected keys: {incompat.unexpected_keys[:5]}")
+    else:
+        print("[load] no --checkpoint given: zero-shot HF weights as-is")
 
     from data import RulerSynthesizer, build_numpy_dataset
 

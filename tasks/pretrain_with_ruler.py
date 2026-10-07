@@ -141,8 +141,11 @@ def _save_with_retry(save_fn, checkpoint_root, global_step, max_retries=3, base_
         try:
             save_fn()
             return
-        except Exception as exc:
-            if attempt == max_retries:
+        except BaseException as exc:
+            # DCP's CheckpointException derives from BaseException (not
+            # Exception) by design; `except Exception` never caught it, which
+            # is how the first retry deployment failed silently.
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)) or attempt == max_retries:
                 raise
             delay = base_delay_sec * (2 ** attempt)
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0

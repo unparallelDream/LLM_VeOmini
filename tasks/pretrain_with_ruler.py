@@ -13,7 +13,9 @@ import wandb
 from tqdm import trange
 from utils.training_utils import format_freeze_summary, freeze_parameters
 
+from torch.distributed.checkpoint import FileSystemWriter
 from veomni.checkpoint import build_checkpointer, ckpt_to_state_dict
+from veomni.checkpoint.dcp_checkpointer import DistributedCheckpointer
 from veomni.data import (
     build_chat_template,
     build_dataloader,
@@ -44,6 +46,22 @@ import models
 
 logger = helper.create_logger(__name__)
 INDEX_TENSOR_KEYS = {"input_ids", "labels", "position_ids", "cache_position", "token_type_ids"}
+
+
+def _create_small_storage_writer(cls, checkpoint_dir):
+    # NFS-safe DCP writes: default thread_count=16 per rank bursts ~32 concurrent
+    # write streams on ~82GB saves (EIO risk); keep serial unless explicitly
+    # overridden. Mirrors pretrain_mass_with_ruler.py for A/B save parity.
+    thread_count = max(1, int(os.environ.get("MASS_DCP_THREAD_COUNT", os.environ.get("DCP_WRITE_THREADS", "1"))))
+    return FileSystemWriter(
+        checkpoint_dir,
+        thread_count=thread_count,
+        single_file_per_rank=True,
+        sync_files=True,
+    )
+
+
+DistributedCheckpointer._create_storage_writer = classmethod(_create_small_storage_writer)
 
 
 @dataclass
@@ -108,6 +126,37 @@ def normalize_model_inputs(batch: Dict[str, Any]) -> Dict[str, Any]:
         else:
             normalized_batch[key] = value
     return normalized_batch
+
+
+def _save_with_retry(save_fn, checkpoint_root, global_step, max_retries=3, base_delay_sec=60.0):
+    """Collective DCP save with exponential-backoff retry for transient storage faults.
+
+    An NFS EIO during DCP writes raises CheckpointException on every rank
+    (DCP gathers write results before returning), so all ranks execute the
+    same retry schedule and stay in sync: 3 retries waiting 1min, 2min, 4min.
+    """
+    import shutil
+
+    for attempt in range(max_retries + 1):
+        try:
+            save_fn()
+            return
+        except Exception as exc:
+            if attempt == max_retries:
+                raise
+            delay = base_delay_sec * (2 ** attempt)
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+            if rank == 0:
+                logger.warning_rank0(
+                    f"[ckpt-retry] DCP save failed at global_step_{global_step} "
+                    f"(attempt {attempt + 1}/{max_retries + 1}): {type(exc).__name__}: {exc}. "
+                    f"Retrying in {delay:.0f}s."
+                )
+                incomplete = os.path.join(checkpoint_root, f"global_step_{global_step}.incomplete")
+                if os.path.isdir(incomplete):
+                    shutil.rmtree(incomplete, ignore_errors=True)
+            dist.barrier()
+            time.sleep(delay)
 
 
 def main():
@@ -841,7 +890,11 @@ def main():
                         "torch_rng_state": torch.get_rng_state(),
                     },
                 }
-                Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+                _save_with_retry(
+                    lambda: Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step),
+                    args.train.save_checkpoint_path,
+                    global_step,
+                )
 
                 dist.barrier()
                 logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
@@ -863,7 +916,11 @@ def main():
                     "torch_rng_state": torch.get_rng_state(),
                 },
             }
-            Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step)
+            _save_with_retry(
+                lambda: Checkpointer.save(args.train.save_checkpoint_path, state, global_steps=global_step),
+                args.train.save_checkpoint_path,
+                global_step,
+            )
             dist.barrier()
             logger.info_rank0(f"Distributed checkpoint saved at {save_checkpoint_path} successfully!")
 

@@ -260,7 +260,13 @@ def main():
         with torch.no_grad():
             for _module in model.modules():
                 if getattr(_module, "enable_lmk_q_proj", False) and hasattr(_module, "lmk_q_proj"):
-                    _module.lmk_q_proj.weight.copy_(_module.q_proj.weight)
+                    if isinstance(_module.lmk_q_proj, torch.nn.Sequential):
+                        # Low-rank lmk_q_proj is residual on q_proj output
+                        # (_project_qkv adds hils_q), so a zeroed up-projection
+                        # makes step-0 lmk_q identical to q_proj output.
+                        _module.lmk_q_proj[-1].weight.zero_()
+                    else:
+                        _module.lmk_q_proj.weight.copy_(_module.q_proj.weight)
                     _module.lmk_q_norm.weight.copy_(_module.q_norm.weight)
                     _w_count += 1
         logger.info_rank0(f"[mass-lmkq] warm-started {_w_count} lmk_q_proj/lmk_q_norm from q_proj/q_norm")

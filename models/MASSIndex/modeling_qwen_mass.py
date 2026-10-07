@@ -156,13 +156,18 @@ class MASSForCausalLM(HiLSForCausalLM):
             grad_seen = torch.zeros((), device=device, dtype=torch.int32)
             for _, param in anchor_params:
                 local_param = _local(param).detach()
-                param_absmax = torch.maximum(param_absmax, local_param.float().abs().max())
-                bad_values += (~torch.isfinite(local_param)).any().to(torch.int32)
+                # FSDP2 uneven sharding can leave a rank with an empty local
+                # shard (e.g. the numel-1 shared_view_bias); an empty shard
+                # contributes nothing to the all-reduced MAX diagnostics.
+                if local_param.numel() > 0:
+                    param_absmax = torch.maximum(param_absmax, local_param.float().abs().max())
+                    bad_values += (~torch.isfinite(local_param)).any().to(torch.int32)
                 if param.grad is not None:
                     local_grad = _local(param.grad).detach()
                     grad_seen += 1
-                    grad_absmax = torch.maximum(grad_absmax, local_grad.float().abs().max())
-                    bad_values += (~torch.isfinite(local_grad)).any().to(torch.int32)
+                    if local_grad.numel() > 0:
+                        grad_absmax = torch.maximum(grad_absmax, local_grad.float().abs().max())
+                        bad_values += (~torch.isfinite(local_grad)).any().to(torch.int32)
 
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 torch.distributed.all_reduce(param_absmax, op=torch.distributed.ReduceOp.MAX)

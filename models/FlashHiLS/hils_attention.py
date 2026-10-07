@@ -297,8 +297,10 @@ class HiLSAttention(nn.Module):
         if self.enable_lmk_q_proj:
             # dtype-safe: the dedicated projection may hold FP32 master weights
             # under mixed-precision training while hidden_states stays BF16.
+            # First-parameter dtype covers both plain Linear and low-rank
+            # Sequential (which has no .weight attribute).
             lmk_q = self.lmk_q_proj(
-                hidden_states.to(self.lmk_q_proj.weight.dtype)
+                hidden_states.to(next(self.lmk_q_proj.parameters()).dtype)
             ).to(hidden_states.dtype)
             if self.lmk_q_lora_dim > 0:
                 lmk_q = lmk_q + hils_q

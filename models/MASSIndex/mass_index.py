@@ -98,7 +98,8 @@ class MultiTangentAnchorGenerator(nn.Module):
         self.anchor_embedding = nn.Parameter(torch.empty(config.num_anchors, config.offset_rank))
         self.offset_basis = nn.Parameter(torch.empty(num_query_heads, head_dim, config.offset_rank))
         if config.shared_view:
-            self.shared_view_bias = nn.Parameter(torch.tensor(float(config.shared_bias_init)))
+            # 0-dim scalar params are rejected by FSDP2 fully_shard; keep numel-1 1D.
+            self.shared_view_bias = nn.Parameter(torch.tensor([float(config.shared_bias_init)]))
         self.reset_parameters()
 
     def reset_parameters(self) -> None:

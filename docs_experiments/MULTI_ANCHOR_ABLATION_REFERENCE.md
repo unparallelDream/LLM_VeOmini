@@ -118,3 +118,15 @@ mass_lora 0.2110 / bsa_lora 0.2066 / **hils_lora 0.3171**(niah 0.475,部分召�
 - 梯度检查点重算一致性:needle ctx 须保留至下一步 forward;
 - 评测 τ:终评用退火终点 0.5(config 残留 0.1 会引入轻微不一致);
 - OLMo 转换:q/k-norm 全隐宽、三明治归一化(post_feedforward)、分片加载;转换初值损失 ~9.2(>qwen 线的 1–2 nat),500 步内观察恢复。
+
+## 补充(2026-10-07):OLMo-199M 缩减+recovery 后的能力检查(dense 基线)
+
+| 任务 | token acc | EM |
+|---|---|---|
+| single_niah | **1.0000** | **1.000** |
+| multi_query | 0.7633 | 0.180 |
+| variable_tracking | 0.8160 | 0.040 |
+| **macro3** | **0.8598** | — |
+
+n=50、4K、无 landmark、标准稠密因果(eval/eval_ruler_dense_olmo.py,`MODELING_BACKEND=hf`)。
+**解读**:①裁剪+recovery(终点 lm 2.79)在检索任务上能力极强,niah 完美——缩减质量检查通过;②这暴露了 Qwen 线 `full` 变体的口径问题:它保留了 landmark 输入,低估了任务上限(0.21 vs 本处 0.86);③OLMo MASS 臂的真上限是 0.86,landmark+稀疏机制的成本=0.86 减 MASS 臂终评。

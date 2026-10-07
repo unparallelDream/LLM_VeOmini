@@ -58,5 +58,6 @@
   "mass_two_stage_backward": true,
   "mass_shared_view": true,
   "mass_shared_bias_init": 2.0,
-  "_attn_implementation": "sdpa"
+  "_attn_implementation": "sdpa",
+  "enable_softmax1": false
 }

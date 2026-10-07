@@ -294,12 +294,12 @@ def mean_ce_loss(model, batches: list[torch.Tensor], device: str) -> float:
     return total_loss / total_tokens
 
 
-def analytic_param_count(target: dict[str, int], num_layers: int, head_dim: int, vocab: int) -> int:
+def analytic_param_count(target: dict[str, int], num_layers: int, head_dim: int, vocab: int, tied: bool = False) -> int:
     hidden = target["hidden_size"]
     q_dim = target["num_attention_heads"] * head_dim
     inter = target["intermediate_size"]
     per_layer = 4 * hidden * q_dim + 3 * hidden * inter + 4 * hidden  # post_attn/post_ffn/q_norm/k_norm 均为 hidden 宽
-    embed_and_head = 2 * vocab * hidden  # untied
+    embed_and_head = (2 if not tied else 1) * vocab * hidden
     return num_layers * per_layer + embed_and_head + hidden
 
 
@@ -331,7 +331,7 @@ def main() -> int:
     sel = select_indices(head_imp, neuron_imp, dim_imp, target, args.strategy)
     student_state = build_student_state_dict(source, sel, target, head_dim)
 
-    expected = analytic_param_count(target, config.num_hidden_layers, head_dim, config.vocab_size)
+    expected = analytic_param_count(target, config.num_hidden_layers, head_dim, config.vocab_size, tied=bool(getattr(config, 'tie_word_embeddings', False)))
     actual = sum(t.numel() for t in student_state.values())
     print(f"[prune-olmo3] params: analytic={expected:,} actual={actual:,}")
     if actual != expected:

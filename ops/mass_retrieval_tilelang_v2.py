@@ -192,8 +192,13 @@ def mass_bitonic_topk_kernel(B, L, N, Hkv, topk, block_l=8, threads=128):
 
             for l, k in T.Parallel(block_l, topk):
                 tq = base_l + l
+                # topk may exceed npad (short sequences: N=16 -> npad=16 <
+                # topk=32); emit -1 for the missing slots instead of reading
+                # index_shared at negative offsets (illegal shared-memory access).
                 if tq < L:
-                    Indices[batch, tq, hkv, k] = index_shared[l, npad - 1 - k]
+                    Indices[batch, tq, hkv, k] = T.if_then_else(
+                        k < npad, index_shared[l, npad - 1 - k], -1
+                    )
     return kernel
 
 
@@ -549,8 +554,14 @@ class _MassEnvelopeTopKV2Fn(torch.autograd.Function):
             reduce_kernel,
         ) = kernels
         candidates = candidate_kernel(queries.contiguous(), mu.contiguous(), bias.contiguous())
+        if os.environ.get("MASS_SYNC_KERNELS", "0") == "1":
+            torch.cuda.synchronize()   # debug: force stream sync between kernels
         indices_raw = topk_kernel(candidates)
+        if os.environ.get("MASS_SYNC_KERNELS", "0") == "1":
+            torch.cuda.synchronize()
         indices = sort_kernel(indices_raw)
+        if os.environ.get("MASS_SYNC_KERNELS", "0") == "1":
+            torch.cuda.synchronize()
 
         # Reuse the tensor-core recompute layout from topk_head_softmax.py.
         # Each selected chunk contributes M compact tangent rows; after the
@@ -565,6 +576,13 @@ class _MassEnvelopeTopKV2Fn(torch.autograd.Function):
         mu_flat = mu.permute(0, 1, 3, 2, 4).reshape(B, N * M, H, D).contiguous()
         q_grouped = queries.reshape(B, L, Hkv, groups, D).contiguous()
         dots = recompute_kernel(q_grouped, mu_flat, expanded)
+        if os.environ.get("MASS_DEBUG_SHAPES", "0") == "1":
+            _dbg = lambda name, t: print(
+                f"[dbg] {name}: nan={torch.isnan(t.float()).float().mean().item():.5f} "
+                f"inf={torch.isinf(t.float()).float().mean().item():.5f}", flush=True)
+            _dbg("indices_raw", indices_raw.float())
+            _dbg("indices(sorted)", indices.float())
+            _dbg("dots", dots)
 
         bias_flat = bias.permute(0, 1, 3, 2).reshape(B, N * M, H).permute(0, 2, 1).contiguous()
         ids_h = safe_expanded.repeat_interleave(groups, dim=2).permute(0, 2, 1, 3).long()
@@ -583,6 +601,11 @@ class _MassEnvelopeTopKV2Fn(torch.autograd.Function):
             # contrast to hard max + STE, every finite anchor plane receives
             # its exact LogSumExp derivative in backward.
             scores = lse_temperature * torch.logsumexp(planes / lse_temperature, dim=-1)
+            if os.environ.get("MASS_DEBUG_SHAPES", "0") == "1":
+                _vr = indices.ge(0).repeat_interleave(groups, dim=2)
+                _poison = (_vr & (torch.isinf(scores) | torch.isnan(scores))).float().sum().item()
+                _nvalid = _vr.float().sum().item()
+                print(f"[dbg] valid_routes={_nvalid:.0f} poisoned_valid_routes={_poison:.0f}", flush=True)
             safe_planes = planes.masked_fill(~valid_routes.unsqueeze(-1), 0.0)
             routing_probs = torch.softmax(safe_planes / lse_temperature, dim=-1)
             routing_probs = routing_probs.masked_fill(~valid_routes.unsqueeze(-1), 0.0)

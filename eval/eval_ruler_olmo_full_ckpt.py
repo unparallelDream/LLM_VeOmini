@@ -48,6 +48,13 @@ def load_full_param_model(args):
         init_device="cuda",
     )
 
+    if args.checkpoint is None:
+        print("[load] zero-shot: base weights + freshly initialized MASS modules", flush=True)
+        if hasattr(model.model, "_collect_mass_aux"):
+            model.model._collect_mass_aux = False
+        model.config.use_cache = False
+        model.eval()
+        return model, {"flavor": args.flavor, "checkpoint": None}
     state = ckpt_to_state_dict(args.checkpoint)
     params = dict(model.named_parameters())
     # 200M runs started before the FSDP2 scalar-param fix: their DCP ckpts
@@ -169,7 +176,7 @@ def main() -> None:
     parser.add_argument("--flavor", choices=("hils", "mass"), required=True)
     parser.add_argument("--config", required=True)
     parser.add_argument("--base-weights", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", required=False, default=None, help="omit for zero-shot base+random MASS modules (kernel debugging)")
     parser.add_argument("--corpus", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--tasks", type=int, nargs="+", default=[0, 1, 2, 3])
@@ -177,6 +184,9 @@ def main() -> None:
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--lse-temperature", type=float, default=None,
+                        help="Override mass_config.lse_temperature after load "
+                             "(mid-training probes must use the annealed tau at that step).")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -188,6 +198,14 @@ def main() -> None:
         trust_remote_code=True,
     )
     model, load_metadata = load_full_param_model(args)
+    if args.lse_temperature is not None:
+        n = 0
+        for _m in model.modules():
+            _mc = getattr(_m, "mass_config", None)
+            if _mc is not None:
+                object.__setattr__(_mc, "lse_temperature", args.lse_temperature)
+                n += 1
+        print(f"[tau] overrode lse_temperature={args.lse_temperature} on {n} modules", flush=True)
 
     dataset = build_numpy_dataset(args.corpus, args.max_seq_len, namespace="test", sort_files=True)
     results = [evaluate_task(model, tokenizer, dataset, args, t) for t in args.tasks]

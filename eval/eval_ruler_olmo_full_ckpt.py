@@ -102,10 +102,22 @@ def evaluate_task(model, tokenizer, dataset, args, task_id: int):
     exact_matches = 0
     elapsed_ms = []
 
+    filler_pool = None
     for sample_idx in range(args.max_samples):
         raw_sample = dataset[sample_idx]
         batch = synthesizer.single_token_eval_collate_fn([raw_sample])
         raw_input = batch["input_ids"]
+        if args.pad_fixed_len and raw_input.shape[1] < args.pad_fixed_len:
+            # prepend corpus filler so every sample hits the same kernel shape;
+            # all positions shift equally, keeping question/answer/needle relative
+            # structure intact (filler sits before the context).
+            need = args.pad_fixed_len - raw_input.shape[1]
+            j = (sample_idx + 1) % len(dataset)
+            filler = torch.from_numpy(dataset[j].astype("int64"))[:need]
+            while filler.shape[0] < need:
+                j += 1
+                filler = torch.cat([filler, torch.from_numpy(dataset[j % len(dataset)].astype("int64"))])
+            raw_input = torch.cat([filler.unsqueeze(0), raw_input], dim=1)
 
         input_ids, labels, position_ids, logits_start, offsets, original_len = (
             prepare_answer_positions(
@@ -184,6 +196,10 @@ def main() -> None:
     parser.add_argument("--max-seq-len", type=int, default=4096)
     parser.add_argument("--chunk-size", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--pad-fixed-len", type=int, default=0,
+                        help="Pad every sample to this exact raw length with corpus filler "
+                             "prepended at the front (constant kernel shape: tilelang "
+                             "compiles once instead of per-sample-length).")
     parser.add_argument("--lse-temperature", type=float, default=None,
                         help="Override mass_config.lse_temperature after load "
                              "(mid-training probes must use the annealed tau at that step).")

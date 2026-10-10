@@ -342,6 +342,86 @@ def mass_selected_dq_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale, threads=128):
     return kernel
 
 
+@tilelang.jit(out_idx=[3], pass_configs=_PASSES)
+def mass_selected_dq_gemm_kernel(
+    B, L, N, H, Hkv, M, D, topk, sm_scale, block_l=16, block_j=16, threads=128
+):
+    """Tensor-core dQ via a block-diagonal gather-GEMM.
+
+    GradQ[b,l,h,:] = sm_scale * Σ_{k,m} GradPlanes[b,l,h,k,m] · Mu[b,idx[l,hkv,k],h,m,:]
+
+    Same gather-materialization family as the forward's
+    recompute_topk_max_pooling_scores_kernel: every (query-row, selected j)
+    Mu row is staged into shared memory, and the per-row reduction becomes a
+    block-diagonal GEMM with weights W[l, l'*block_j+j] = grad[l, j] if
+    l'==l else 0.  The GEMM carries a block_l-fold redundancy, but tensor
+    cores make it far cheaper than the scalar per-query kernel above, which
+    profiled at 422ms/call (L=8322, N=130, K=32, M=2, D=128) against a ~3ms
+    memory roofline.  Env MASS_DQ_LEGACY=1 restores the scalar kernel.
+    """
+    dtype, accum_dtype, idx_dtype = "bfloat16", "float", "int32"
+    groups = H // Hkv
+    j_total = topk * M
+    mu_shape = [B, N, H, M, D]
+    index_shape = [B, L, Hkv, topk]
+    plane_grad_shape = [B, L, H, topk, M]
+    q_shape = [B, L, H, D]
+
+    @T.prim_func
+    def kernel(
+        Mu: T.Tensor(mu_shape, dtype),
+        Indices: T.Tensor(index_shape, idx_dtype),
+        GradPlanes: T.Tensor(plane_grad_shape, accum_dtype),
+        GradQ: T.Tensor(q_shape, accum_dtype),
+    ):
+        with T.Kernel(tilelang.cdiv(L, block_l), Hkv, B, threads=threads) as (bx, hkv, batch):
+            base_l = bx * block_l
+            g_shared = T.alloc_shared([block_l * block_j, D], dtype)
+            w_shared = T.alloc_shared([block_l, block_l * block_j], dtype)
+            acc = T.alloc_fragment([block_l, D], accum_dtype)
+            for g in T.serial(groups):
+                h = hkv * groups + g
+                T.clear(acc)
+                for j_tile in T.serial((j_total + block_j - 1) // block_j):
+                    base_j = j_tile * block_j
+                    for l, jj, d in T.Parallel(block_l, block_j, D):
+                        tq = base_l + l
+                        j = base_j + jj
+                        row = l * block_j + jj
+                        if (tq < L) and (j < j_total):
+                            n = Indices[batch, tq, hkv, j // M]
+                            if (n >= 0) and (n < N):
+                                g_shared[row, d] = Mu[batch, n, h, j % M, d]
+                            else:
+                                g_shared[row, d] = T.Cast(dtype, 0.0)
+                        else:
+                            g_shared[row, d] = T.Cast(dtype, 0.0)
+                    for l, l2, jj in T.Parallel(block_l, block_l, block_j):
+                        tq = base_l + l
+                        j = base_j + jj
+                        col = l2 * block_j + jj
+                        if (l2 == l) and (tq < L) and (j < j_total):
+                            w_shared[l, col] = T.Cast(
+                                dtype, GradPlanes[batch, tq, h, j // M, j % M]
+                            )
+                        else:
+                            w_shared[l, col] = T.Cast(dtype, 0.0)
+                    T.sync_threads()
+                    T.gemm(
+                        w_shared,
+                        g_shared,
+                        acc,
+                        transpose_B=False,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
+                    T.sync_threads()
+                for l, d in T.Parallel(block_l, D):
+                    tq = base_l + l
+                    if tq < L:
+                        GradQ[batch, tq, h, d] = acc[l, d] * sm_scale
+    return kernel
+
+
 @tilelang.jit(pass_configs=_PASSES)
 def mass_selected_dmu_dbias_kernel(
     B, L, N, H, Hkv, M, D, topk, sm_scale, block_l=16, threads=256
@@ -491,6 +571,91 @@ def mass_selected_partial_bwd_kernel(
                         Partials[batch, h, tile, row, d] = partial[n, d]
                         if d == 0:
                             PartialBias[batch, h, tile, row] = partial_bias[n]
+    return kernel
+
+
+@tilelang.jit(pass_configs=_PASSES)
+def mass_selected_partial_bwd_mt_kernel(
+    B,
+    L,
+    N,
+    H,
+    Hkv,
+    M,
+    D,
+    topk,
+    sm_scale,
+    block_q=32,
+    threads=256,
+    topk_tile=8,
+):
+    """Merged-tangent partial accumulation: one launch covers all M tangents.
+
+    Same [N, D] shared partial table and accumulation body as
+    mass_selected_partial_bwd_kernel; the tangent folds into the grid's head
+    axis (by = h*M + tangent) so the M per-tangent launches collapse into one
+    kernel object and one launch.  The body is kept character-identical to
+    the per-tangent kernel: wrapping the accumulate loop in an outer
+    T.serial(tangent) instead miscompiles shared-memory atomics under
+    free-mode layout inference, which is why the tangent lives in the grid.
+    Env MASS_PARTIAL_LEGACY=1 restores the per-tangent kernels.
+    """
+    dtype, accum_dtype, idx_dtype = "bfloat16", "float", "int32"
+    groups = H // Hkv
+    num_tiles = tilelang.cdiv(L, block_q)
+    q_shape = [B, L, H, D]
+    index_shape = [B, L, Hkv, topk]
+    plane_grad_shape = [B, L, H, topk, M]
+    partial_shape = [B, H, num_tiles, N * M, D]
+    partial_bias_shape = [B, H, num_tiles, N * M]
+
+    @T.prim_func
+    def kernel(
+        Q: T.Tensor(q_shape, dtype),
+        Indices: T.Tensor(index_shape, idx_dtype),
+        GradPlanes: T.Tensor(plane_grad_shape, accum_dtype),
+        Partials: T.Tensor(partial_shape, accum_dtype),
+        PartialBias: T.Tensor(partial_bias_shape, accum_dtype),
+    ):
+        with T.Kernel(num_tiles, H * M, B, threads=threads) as (tile, ht, batch):
+            h = ht // M
+            tangent = ht % M
+            base_q = tile * block_q
+            hkv = h // groups
+            # One tangent per block keeps the shared table at [N, D] (~65 KiB
+            # for OLMo3 N=130, D=128).
+            partial = T.alloc_shared([N, D], accum_dtype)
+            partial_bias = T.alloc_shared([N], accum_dtype)
+            # 清零/写回必须整块 Parallel(N, D):旧实现按 row_tile=8 分轮的写法
+            # 在 free-mode 布局推导下会与累加段对同一 shared 表的原子访问产生
+            # 冲突的布局假设,导致丢/重更新(计数测试可差 10+)。
+            for n, d in T.Parallel(N, D):
+                partial[n, d] = 0.0
+                if d == 0:
+                    partial_bias[n] = 0.0
+            T.sync_threads()
+
+            # 累加段:Parallel(q, d) + k 内层 serial(与已验证的 dq kernel 同构)。
+            for q_local, d in T.Parallel(block_q, D):
+                tq = base_q + q_local
+                if tq < L:
+                    for k in T.serial(topk):
+                        n = Indices[batch, tq, hkv, k]
+                        if (n >= 0) and (n < N):
+                            grad = GradPlanes[batch, tq, h, k, tangent]
+                            T.atomic_add(
+                                partial[n, d],
+                                grad * T.Cast(accum_dtype, Q[batch, tq, h, d]) * sm_scale,
+                            )
+                            if d == 0:
+                                T.atomic_add(partial_bias[n], grad)
+            T.sync_threads()
+
+            for n, d in T.Parallel(N, D):
+                row = n * M + tangent
+                Partials[batch, h, tile, row, d] = partial[n, d]
+                if d == 0:
+                    PartialBias[batch, h, tile, row] = partial_bias[n]
     return kernel
 
 
@@ -881,9 +1046,20 @@ def mass_retrieval_tilelang_v2(
                 sm_scale=sm_scale,
                 per_qhead_lmks=True,
             ),
-            mass_selected_dq_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
+            # dQ: block-diagonal gather-GEMM by default (29% of GPU kernel
+            # time in the 2026-10-10 trace came from the scalar kernel);
+            # MASS_DQ_LEGACY=1 restores it.
+            mass_selected_dq_gemm_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale)
+            if os.environ.get("MASS_DQ_LEGACY", "0") != "1"
+            else mass_selected_dq_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
             mass_selected_dmu_dbias_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
-            tuple(
+            # Partial accumulation: merged-tangent single launch by default;
+            # MASS_PARTIAL_LEGACY=1 restores the per-tangent kernels.
+            (
+                mass_selected_partial_bwd_mt_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
+            )
+            if os.environ.get("MASS_PARTIAL_LEGACY", "0") != "1"
+            else tuple(
                 mass_selected_partial_bwd_kernel(
                     B, L, N, H, Hkv, M, D, topk, sm_scale, tangent
                 )

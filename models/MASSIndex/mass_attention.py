@@ -279,6 +279,291 @@ class MASSAttention(HiLSAttention):
         output = torch.matmul(probs, v_heads).transpose(1, 2)
         return (output * has_selected.to(output.dtype)).to(q.dtype)
 
+    def _forward_with_cache(
+        self,
+        hidden_states,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, None]:
+        """KV-cache continuation, mirroring HiLSAttention's inference strategy.
+
+        The cache keeps the full K/V history (landmark-layout K rows included
+        whenever the caller inserted landmarks; raw streams pool by position).
+        Per step: SWA runs over the full cache, the tangent summaries ``mu`` are
+        recomputed from the full K (cheap for realistic chunk counts), the
+        per-chunk anchor base rows (``lmk_q`` at chunk ends) come from
+        ``past_key_values._mass_prior_cache`` because query projections of past
+        positions cannot be recovered from K, and the sparse value attention
+        consumes the full cache with the newly selected chunk indices.
+        """
+        B, L, _ = hidden_states.shape
+        cos, sin = position_embeddings
+        self.last_mass_balance_loss = None
+        self.last_mass_anchor_load = None
+        self.last_mass_conditional_entropy = None
+        self.last_mass_marginal_entropy = None
+        self.last_mass_diversity_loss = None
+
+        hils_q_nope, hils_k_nope, hils_v, lmk_q = self._project_qkv(hidden_states)
+        kernel_dtype = torch.bfloat16
+        hils_q_nope = hils_q_nope.to(kernel_dtype)
+        hils_k_nope = hils_k_nope.to(kernel_dtype)
+        hils_v = hils_v.to(kernel_dtype)
+        lmk_q = lmk_q.to(kernel_dtype)
+        hils_q_rope, hils_k_rope, lmk_q = self._apply_hils_rope(
+            hils_q_nope, hils_k_nope, lmk_q, cos, sin
+        )
+
+        hils_k_for_cache = hils_k_rope if self.apply_hils_rope else hils_k_nope
+        hils_cache_idx = self.layer_idx + self.config.num_hidden_layers
+        hils_k_full, hils_v_full = past_key_values.update(
+            hils_k_for_cache, hils_v, hils_cache_idx, {"cache_position": cache_position}
+        )
+        if self.apply_hils_rope:
+            hils_k_rope = hils_k_full
+        else:
+            hils_k_nope = hils_k_full
+            hils_k_rope = hils_k_nope
+        hils_v = hils_v_full
+        full_seq_len = hils_k_full.shape[1]
+
+        swa_o, lse_swa = flex_attn_tl(
+            hils_q_rope,
+            hils_k_rope,
+            hils_v,
+            window_size=self.hils_sliding_window,
+            chunk_size=self.chunk_size,
+            training=False,
+            mask_lmk=True,
+            expand_to_chunk=True,
+        )
+        lse_swa = lse_swa.contiguous().to(hidden_states.dtype)
+
+        if full_seq_len < self.chunk_size:
+            swa_weight = (
+                torch.sigmoid(lse_swa).to(swa_o.dtype) if self.enable_softmax1 else 1.0
+            )
+            output = swa_o * swa_weight.unsqueeze(-1) if self.enable_softmax1 else swa_o
+            output = rearrange(output, "b l h d -> b l (h d)")
+            return self.o_proj(output.to(self.o_proj.weight.dtype)), None
+
+        if L == full_seq_len:
+            # Prompt prefill with cache enabled: identical math to the training
+            # path, then stash the chunk-end anchor base rows for later steps.
+            outputs = self._mass_prefill_core(
+                hidden_states,
+                hils_q_rope=hils_q_rope,
+                hils_k_rope=hils_k_rope,
+                hils_q_nope=hils_q_nope,
+                hils_k_nope=hils_k_nope,
+                hils_v=hils_v,
+                lmk_q=lmk_q,
+                swa_o=swa_o,
+                lse_swa=lse_swa,
+                is_training=False,
+            )
+            self._update_prior_anchor_cache(past_key_values, full_seq_len, lmk_q)
+            return outputs
+
+        # ---- decode continuation (L < full_seq_len) ----
+        key_source = hils_k_rope if self.apply_hils_rope else hils_k_nope
+        self._update_prior_anchor_cache(past_key_values, full_seq_len, lmk_q)
+        prior_cache = past_key_values._mass_prior_cache[self.layer_idx]
+        indices, scores = self._decode_retrieval(key_source, lmk_q, full_seq_len, L, prior_cache)
+
+        if lse_swa.shape[2] != scores.shape[2]:
+            if scores.shape[2] % lse_swa.shape[2] != 0:
+                raise ValueError("SWA LSE head count is incompatible with MASS query heads")
+            lse_swa = lse_swa.repeat_interleave(scores.shape[2] // lse_swa.shape[2], dim=2)
+        if self.enable_softmax1:
+            normalizer = torch.zeros(
+                B, L, scores.shape[2], 1, device=scores.device, dtype=scores.dtype
+            )
+            mixture_logits = torch.cat(
+                [scores, lse_swa.unsqueeze(-1).to(scores.dtype), normalizer], dim=-1
+            )
+            swa_weight_index = -2
+        else:
+            mixture_logits = torch.cat([scores, lse_swa.unsqueeze(-1).to(scores.dtype)], dim=-1)
+            swa_weight_index = -1
+        weights = F.softmax(mixture_logits, dim=-1).to(hidden_states.dtype)
+
+        hils_q = hils_q_rope if self.apply_hils_rope else hils_q_nope
+        # Mirror the parent HiLS decode call: default block_M/num_threads. The
+        # training-tuned explicit block_M layout does not compile at L=1.
+        hils_o = self.hils_func(
+            hils_q,
+            hils_k_full,
+            hils_v,
+            weights=weights,
+            indices=indices.to(torch.int32).contiguous(),
+            block_size=self.chunk_size,
+            mask_last_token=True,
+            is_training=False,
+        )
+        output = torch.addcmul(
+            hils_o, swa_o, weights[:, :, :, swa_weight_index].unsqueeze(-1)
+        )
+        output = rearrange(output, "b l h d -> b l (h d)")
+        return self.o_proj(output.to(self.o_proj.weight.dtype)), None
+
+    def _update_prior_anchor_cache(self, past_key_values, full_seq_len, lmk_q):
+        """Append the anchor base rows (chunk-end ``lmk_q``) of newly completed chunks.
+
+        A chunk completes exactly when its end row is part of the current input,
+        so the rows are always extractable from ``lmk_q`` of this forward.
+        """
+        if not hasattr(past_key_values, "_mass_prior_cache"):
+            past_key_values._mass_prior_cache = {}
+        cache = past_key_values._mass_prior_cache.get(self.layer_idx, None)
+        cached_chunks = 0 if cache is None else cache["base_anchor"].shape[1]
+        full_chunks = full_seq_len // self.chunk_size
+        if full_chunks <= cached_chunks:
+            return
+        end_positions = torch.arange(
+            cached_chunks * self.chunk_size + self.chunk_size - 1,
+            full_chunks * self.chunk_size,
+            self.chunk_size,
+            device=lmk_q.device,
+        )
+        new_rows = lmk_q[:, end_positions - (full_seq_len - lmk_q.shape[1]), :, :]
+        if cache is not None:
+            new_rows = torch.cat([cache["base_anchor"], new_rows.to(cache["base_anchor"].dtype)], dim=1)
+            cache["base_anchor"] = new_rows.to(torch.bfloat16).contiguous()
+        else:
+            past_key_values._mass_prior_cache[self.layer_idx] = {
+                "base_anchor": new_rows.to(torch.bfloat16).contiguous(),
+            }
+
+    def _decode_retrieval(self, key_source, lmk_q, full_seq_len, L, prior_cache):
+        """Reference (PyTorch) upper-envelope Top-K for cache continuation.
+
+        Mirrors the kernel math exactly as documented in ``_needle_info_nce``:
+        planes = q.mu*sm_scale + b, view-0 replaced by the shared landmark-key
+        plane, envelope over views with the current temperature, window
+        eligibility ``n < (row - window + 1) // chunk_size``. Selection is per
+        KV-head group (mean over its query heads); scores are gathered per
+        query head at its group's selected chunks.
+        """
+        full_chunks = full_seq_len // self.chunk_size
+        base_anchor = prior_cache["base_anchor"]
+        if base_anchor.shape[1] < full_chunks:
+            raise RuntimeError(
+                "MASS decode continuation requires the prior anchor cache; "
+                "the prompt forward must run with use_cache=True."
+            )
+        base_anchor = base_anchor[:, :full_chunks]
+
+        # mu/b of a completed chunk are immutable — recompute only the newly
+        # completed chunks and reuse the cached rest (per decode step this
+        # drops the N-chunk tangent pooling to an append every chunk_size
+        # steps plus a small q.mu einsum).
+        cached_summary = prior_cache.get("tangent_summary", None)
+        if cached_summary is not None and cached_summary.mu.shape[1] == full_chunks:
+            summary = cached_summary
+        else:
+            key_chunks = key_source[:, : full_chunks * self.chunk_size]
+            key_chunks = rearrange(key_chunks, "b (n s) h d -> b n s h d", s=self.chunk_size)
+            cached_n = 0
+            if cached_summary is not None:
+                cached_n = min(cached_summary.mu.shape[1], full_chunks)
+            if cached_n < full_chunks:
+                new_k = key_chunks[:, cached_n:]
+                new_a = base_anchor[:, cached_n:]
+                from .mass_index import MassTangentSummary
+                new_s = build_mass_tangent_summary(
+                    new_a, new_k, self.mass_anchor_generator, sm_scale=self.scaling
+                )
+                if cached_n:
+                    summary = MassTangentSummary(
+                        mu=torch.cat([cached_summary.mu, new_s.mu], dim=1),
+                        b=torch.cat([cached_summary.b, new_s.b], dim=1),
+                        anchors=torch.cat([cached_summary.anchors, new_s.anchors], dim=1),
+                    )
+                else:
+                    summary = new_s
+            else:
+                summary = cached_summary
+            prior_cache["tangent_summary"] = summary
+        shared_bias = getattr(self.mass_anchor_generator, "shared_view_bias", None)
+        groups = lmk_q.shape[2] // key_source.shape[2]
+        planes = torch.einsum(
+            "blhd,bnmhd->blnmh", lmk_q.float(), summary.mu.float()
+        ) * self.scaling + summary.b.float()[:, None]
+        if shared_bias is not None:
+            shared_key = key_source[:, self.chunk_size - 1 :: self.chunk_size, :, :][
+                :, :full_chunks
+            ].float()
+            shared_plane = (
+                torch.einsum("blhd,bnhd->blnh", lmk_q.float(), shared_key.repeat_interleave(groups, dim=2))
+                * self.scaling
+                + shared_bias.float()
+            )
+            planes = torch.cat([shared_plane.unsqueeze(3), planes[..., 1:, :]], dim=3)
+        num_views = planes.shape[3]
+        if self.mass_config.score_reduction == "logsumexp":
+            scores_all = self.mass_config.lse_temperature * torch.logsumexp(
+                planes / self.mass_config.lse_temperature, dim=3
+            )
+            if self.mass_config.normalize_lse:
+                scores_all = scores_all - self.mass_config.lse_temperature * math.log(
+                    num_views
+                )
+        else:
+            scores_all = planes.max(dim=3).values
+        # scores_all: [B, L, N, Hq]
+
+        q_offset = full_seq_len - L
+        rows = q_offset + torch.arange(L, device=scores_all.device)
+        window = int(self.hils_sliding_window or 0)
+        if window > 0:
+            limits = (rows - window + 1) // self.chunk_size
+        else:
+            limits = rows // self.chunk_size
+        eligible = (
+            torch.arange(full_chunks, device=scores_all.device)[None, None, :]
+            < limits.clamp_min(0)[:, None]
+        )  # [1, L, N]
+        scores_all = scores_all.masked_fill(~eligible[..., None], float("-inf"))
+
+        # The sparse kernels are only ever compiled for K = self.topk (the
+        # prefill path always requests that many), so keep K fixed here too:
+        # top-k over the available chunks, then pad to self.topk with -inf
+        # scores (zero softmax mass) and dummy chunk-0 indices.
+        k_eff = min(self.topk, full_chunks)
+        # Per-KV-head selection aggregated exactly like the kernel: LSE over
+        # the group's query-head scores at the retrieval temperature (or max
+        # in non-LSE reduction mode). See mass_retrieval_tilelang_v2's
+        # group_max/exp_sum loop.
+        Bq, Lq, _, Hq = scores_all.shape
+        scores_grouped = scores_all.view(Bq, Lq, full_chunks, key_source.shape[2], groups)
+        if self.mass_config.score_reduction == "logsumexp":
+            grouped = self.mass_config.lse_temperature * torch.logsumexp(
+                scores_grouped / self.mass_config.lse_temperature, dim=-1
+            )
+        else:
+            grouped = scores_grouped.max(dim=-1).values
+        grouped = grouped.permute(0, 1, 3, 2)  # [B, L, Hkv, N]
+        top_scores, top_idx = grouped.topk(k_eff, dim=-1)  # [B, L, Hkv, k_eff]
+        if k_eff < self.topk:
+            pad = self.topk - k_eff
+            top_idx = F.pad(top_idx, (0, pad), value=0)
+            top_scores = F.pad(top_scores, (0, pad), value=float("-inf"))
+        indices_hq = top_idx.repeat_interleave(groups, dim=2).clamp_min(0)
+        gathered = torch.gather(
+            scores_all.permute(0, 1, 3, 2), 3, indices_hq
+        )  # [B, L, Hq, K]: gather along the chunk axis (dim 3 after permute)
+        if k_eff < self.topk:
+            gathered = F.pad(gathered, (0, self.topk - k_eff), value=float("-inf"))
+        # Early decode rows with no eligible chunk: kernel semantics yield a
+        # SWA-only mixture (sparse mass zero). Gathered -inf scores produce a
+        # zero softmax weight on every sparse branch, which matches.
+        return top_idx, gathered.to(torch.bfloat16)
+
     def forward(
         self,
         hidden_states,
@@ -291,10 +576,15 @@ class MASSAttention(HiLSAttention):
         position_embeddings=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, None]:
-        if use_cache or past_key_values is not None:
-            raise NotImplementedError(
-                "MASSAttention MVP currently supports training/prefill only; "
-                "multi-tangent cache continuation is the next implementation stage."
+        if use_cache and past_key_values is not None:
+            return self._forward_with_cache(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **kwargs,
             )
         if position_embeddings is None:
             raise ValueError("MASSAttention requires precomputed RoPE position_embeddings")
@@ -328,6 +618,35 @@ class MASSAttention(HiLSAttention):
         )
         lse_swa = lse_swa.contiguous().to(hidden_states.dtype)
 
+        return self._mass_prefill_core(
+            hidden_states,
+            hils_q_rope=hils_q_rope,
+            hils_k_rope=hils_k_rope,
+            hils_q_nope=hils_q_nope,
+            hils_k_nope=hils_k_nope,
+            hils_v=hils_v,
+            lmk_q=lmk_q,
+            swa_o=swa_o,
+            lse_swa=lse_swa,
+            is_training=self.training,
+        )
+
+    def _mass_prefill_core(
+        self,
+        hidden_states,
+        *,
+        hils_q_rope,
+        hils_k_rope,
+        hils_q_nope,
+        hils_k_nope,
+        hils_v,
+        lmk_q,
+        swa_o,
+        lse_swa,
+        is_training,
+    ):
+        """Shared prefill math for both the training path and cache prompts."""
+        B, L, _ = hidden_states.shape
         if L < self.chunk_size:
             self.last_mass_anchor_load = torch.full(
                 (self.mass_config.num_anchors,),
@@ -412,7 +731,10 @@ class MASSAttention(HiLSAttention):
                 sparse_num_threads_fwd = math.lcm(
                     64, 2 * query_heads_per_kv_head * block_m
                 )
-                sparse_num_threads_bwd = sparse_num_threads_fwd
+                # bwd 线程 64→128:该 kernel 85KB smem 限制每 SM 1 block,64 线程
+                # 严重欠载;每-query 索引(merged_len~480)实测 5071→3524ms(-30%),
+                # chunk 共享索引(merged_len~32)-3%,数值与 64 线程逐位一致。
+                sparse_num_threads_bwd = max(128, sparse_num_threads_fwd)
             hils_o = self.hils_func(
                 hils_q,
                 hils_k,
@@ -424,7 +746,7 @@ class MASSAttention(HiLSAttention):
                 num_threads_fwd=sparse_num_threads_fwd,
                 num_threads_bwd=sparse_num_threads_bwd,
                 mask_last_token=True,
-                is_training=self.training,
+                is_training=is_training,
             )
         output = torch.addcmul(hils_o, swa_o, weights[:, :, :, swa_weight_index].unsqueeze(-1))
         output = rearrange(output, "b l h d -> b l (h d)")

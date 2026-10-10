@@ -507,7 +507,7 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M_inverse(
     batch, heads, q_len, kv_len, head_dim,
     scale=None, block_size=64, groups=16, selected_blocks=16, num_weights=None,
     dtype="bfloat16", accum_dtype="float", block_M=0, mask_last_token=True,
-    num_threads=None, v_head_dim=None, enable_alibi=False,
+    num_threads=None, v_head_dim=None, enable_alibi=False, num_stages=0,
 ):
 
     enable_last_token_mask = False
@@ -561,7 +561,6 @@ def hierarchical_sparse_attention_bwd_dqkv_block_M_inverse(
 
     if num_threads is None:
         num_threads = 128
-    num_stages = 0
 
 
     NP_bwd = tilelang.cdiv(q_len, M)

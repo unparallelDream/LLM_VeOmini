@@ -100,17 +100,7 @@ mass_lora 0.2110 / bsa_lora 0.2066 / **hils_lora 0.3171**(niah 0.475,部分召�
 
 ---
 
-## 四、建议的后续消融(按优先级,未试项)
-
-1. **长度/预算维度兑现选择**:B 臂 vs hils_lora @ 8K/16K/32K + topk∈{8,16}——选择能力(0.664@topk8)应在此兑换为下游增益;
-2. **协议效应 0.6B 复核**:0.6B 纯锚新协议臂(此前臂被中止@7.5k,探针已存);
-3. **0.6B shared-noNCI**:隔离 NCI 在 0.6B 的税(90M 标定未必可外推——0.6B 是 hils_lora 部分召回大胜的规模);
-4. **NCI 剂量精扫**:w∈{0.5,1,2,4}(OLMo-199M 上做最便宜);
-5. **M 数消融**(在 olmo-7B 维度,M=8 kernel 已验证)/ anchor offset 初始尺度;
-6. 结构备选:Expert-Choice 路由、内容条件 offset、router z-loss、路由噪声(gumbel 接口已在 `topk_head_softmax.py`);
-7. 规模阶梯:OLMo-199M(在跑)→ 7B-LoRA 4×A800(6–9 天)。
-
-## 五、基建坑清单(复现必读)
+## 四、基建坑清单(复现必读)
 
 - kernel M 约束:0.6B/90M 维度仅 M=2;M+1 拼接编不过 → 用 replace 模式;
 - tilelang 缓存必须本地(`TILELANG_CACHE_DIR=/dev/shm/...`),NFS mmap 崩溃 3 起断点恢复;

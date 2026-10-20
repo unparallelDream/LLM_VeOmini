@@ -4,7 +4,6 @@
   "hils_topk": 32,
   "full_attn_interleave": 4,
   "insert_landmarks": true,
-  "auto_insert_lmk": false,
   "adjust_lmk_pos": true,
   "enable_external_lmk_embed": true,
   "enable_lmk_q_proj": true,

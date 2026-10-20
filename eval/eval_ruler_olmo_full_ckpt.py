@@ -40,11 +40,13 @@ def load_full_param_model(args):
     from veomni.checkpoint import ckpt_to_state_dict
     from veomni.models import build_foundation_model
 
+    import os as _os
+    _attn = "flash_attention_2" if _os.environ.get("FA2_ATTN", "0") == "1" else "sdpa"
     model = build_foundation_model(
         config_path=args.config,
         weights_path=args.base_weights,
         torch_dtype="bfloat16",
-        attn_implementation="sdpa",
+        attn_implementation=_attn,
         init_device="cuda",
     )
 

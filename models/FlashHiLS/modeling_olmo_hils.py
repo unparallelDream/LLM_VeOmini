@@ -735,7 +735,6 @@ class HiLSForCausalLM(Olmo3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config, **kwargs):
-        auto_insert_lmk = kwargs.pop('auto_insert_lmk', None)
         super().__init__(config)
         self.model = HiLSModel(config)
         self.vocab_size = get_model_vocab_size(config)
@@ -744,17 +743,8 @@ class HiLSForCausalLM(Olmo3PreTrainedModel, GenerationMixin):
         self.adjust_lmk_pos = getattr(config, "adjust_lmk_pos", self.insert_landmarks)
         self.lmk_id = config.vocab_size if self.insert_landmarks else None
         self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
-        self.auto_insert_lmk = auto_insert_lmk if auto_insert_lmk is not None else getattr(config, 'auto_insert_lmk', False)
 
         self._gen_state = GenerateState()
-
-        _auto_lmk = kwargs.pop("auto_insert_lmk", None) or getattr(config, "auto_insert_lmk", False)
-        self.auto_insert_lmk = str(_auto_lmk).lower() in ('true', '1', 'yes') if isinstance(_auto_lmk, str) else bool(_auto_lmk)
-        if not self.insert_landmarks and self.auto_insert_lmk:
-            logger.warning_once(
-                "auto_insert_lmk=True is ignored because insert_landmarks=False."
-            )
-            self.auto_insert_lmk = False
 
         # Initialize weights and apply final processing
         self.post_init()

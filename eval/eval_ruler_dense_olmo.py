@@ -43,8 +43,10 @@ def main():
     torch.manual_seed(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    import os as _os
+    _attn = "flash_attention_2" if _os.environ.get("FA2_ATTN", "0") == "1" else "sdpa"
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.bfloat16, attn_implementation="sdpa"
+        args.model, torch_dtype=torch.bfloat16, attn_implementation=_attn
     ).to("cuda")
     model.eval()
 

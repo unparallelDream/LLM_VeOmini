@@ -411,6 +411,84 @@ class MASSAttention(HiLSAttention):
         output = rearrange(output, "b l h d -> b l (h d)")
         return self.o_proj(output.to(self.o_proj.weight.dtype)), None
 
+    def _reference_retrieval_prefill(self, lmk_q, key_source):
+        """Fallback full-sequence retrieval with the reference envelope math.
+
+        Same planes/envelope/window semantics as the kernel (see
+        ``_needle_info_nce``); q rows are processed in blocks to keep the
+        [B, rows, N, M, Hq] workspace small. Only used for inference when the
+        TileLang kernel fails to compile an unusual padded shape.
+        """
+        B, L, H, D = lmk_q.shape
+        full_chunks = L // self.chunk_size
+        base_anchor = lmk_q[:, self.chunk_size - 1 :: self.chunk_size, :, :][:, :full_chunks]
+        key_chunks = key_source[:, : full_chunks * self.chunk_size]
+        key_chunks = rearrange(key_chunks, "b (n s) h d -> b n s h d", s=self.chunk_size)
+        summary = build_mass_tangent_summary(
+            base_anchor, key_chunks, self.mass_anchor_generator, sm_scale=self.scaling
+        )
+        shared_bias = getattr(self.mass_anchor_generator, "shared_view_bias", None)
+        groups = H // key_source.shape[2]
+        window = int(self.hils_sliding_window or 0)
+        row_block = max(1, 512 - 512 % max(1, self.chunk_size))
+        all_idx, all_scores = [], []
+        for r0 in range(0, L, row_block):
+            rows = torch.arange(r0, min(r0 + row_block, L), device=lmk_q.device)
+            q = lmk_q[:, rows, :, :]
+            planes = torch.einsum("blhd,bnmhd->blnmh", q.float(), summary.mu.float()) * self.scaling
+            planes = planes + summary.b.float()[:, None]
+            if shared_bias is not None:
+                shared_key = key_source[:, self.chunk_size - 1 :: self.chunk_size, :, :][
+                    :, :full_chunks
+                ].float()
+                shared_plane = (
+                    torch.einsum(
+                        "blhd,bnhd->blnh", q.float(), shared_key.repeat_interleave(groups, dim=2)
+                    )
+                    * self.scaling
+                    + shared_bias.float()
+                )
+                planes = torch.cat([shared_plane.unsqueeze(3), planes[..., 1:, :]], dim=3)
+            num_views = planes.shape[3]
+            if self.mass_config.score_reduction == "logsumexp":
+                scores_all = self.mass_config.lse_temperature * torch.logsumexp(
+                    planes / self.mass_config.lse_temperature, dim=3
+                )
+                if self.mass_config.normalize_lse:
+                    scores_all = scores_all - self.mass_config.lse_temperature * math.log(num_views)
+            else:
+                scores_all = planes.max(dim=3).values
+            del planes
+            chunk_ids = torch.arange(full_chunks, device=scores_all.device)
+            if window > 0:
+                limits = (rows - window + 1) // self.chunk_size
+            else:
+                limits = rows // self.chunk_size
+            eligible = chunk_ids[None, :] < limits.clamp_min(0)[:, None]
+            scores_all = scores_all.masked_fill(~eligible[:, None, :, None], float("-inf"))
+            k_eff = min(self.topk, full_chunks)
+            grouped = scores_all.view(scores_all.shape[0], rows.shape[0], full_chunks, key_source.shape[2], groups)
+            # Hard max over the group's q heads, matching the TileLang
+            # candidates kernel's selection semantics (see _decode_retrieval).
+            grouped = grouped.max(dim=-1).values
+            grouped = grouped.permute(0, 1, 3, 2)
+            top_scores, top_idx = grouped.topk(k_eff, dim=-1)
+            # Same consumption contract as _decode_retrieval: ascending valid
+            # indices, -1 padding at the tail (never 0).
+            top_idx = torch.sort(top_idx, dim=-1).values
+            if k_eff < self.topk:
+                top_idx = F.pad(top_idx, (0, self.topk - k_eff), value=-1)
+            indices_hq = top_idx.repeat_interleave(groups, dim=2).clamp_min(0)
+            gathered = torch.gather(scores_all.permute(0, 1, 3, 2), 3, indices_hq)
+            gathered = gathered.masked_fill(
+                top_idx.repeat_interleave(groups, dim=2).lt(0), float("-inf")
+            )
+            all_idx.append(top_idx)
+            all_scores.append(gathered.to(torch.bfloat16))
+        indices = torch.cat(all_idx, dim=1)
+        scores = torch.cat(all_scores, dim=1)
+        return MassTopKResult(indices, scores, None, None, None, None)
+
     def _update_prior_anchor_cache(self, past_key_values, full_seq_len, lmk_q):
         """Append the anchor base rows (chunk-end ``lmk_q``) of newly completed chunks.
 
@@ -446,8 +524,9 @@ class MASSAttention(HiLSAttention):
         planes = q.mu*sm_scale + b, view-0 replaced by the shared landmark-key
         plane, envelope over views with the current temperature, window
         eligibility ``n < (row - window + 1) // chunk_size``. Selection is per
-        KV-head group (mean over its query heads); scores are gathered per
-        query head at its group's selected chunks.
+        KV-head group with a hard max over its query heads (identical to the
+        kernel for every GQA/MHA config); scores are gathered per query head
+        at its group's selected chunks.
         """
         full_chunks = full_seq_len // self.chunk_size
         base_anchor = prior_cache["base_anchor"]
@@ -532,33 +611,36 @@ class MASSAttention(HiLSAttention):
 
         # The sparse kernels are only ever compiled for K = self.topk (the
         # prefill path always requests that many), so keep K fixed here too:
-        # top-k over the available chunks, then pad to self.topk with -inf
-        # scores (zero softmax mass) and dummy chunk-0 indices.
+        # top-k over the available chunks, then pad to self.topk with -1
+        # indices and -inf scores (zero softmax mass).
         k_eff = min(self.topk, full_chunks)
-        # Per-KV-head selection aggregated exactly like the kernel: LSE over
-        # the group's query-head scores at the retrieval temperature (or max
-        # in non-LSE reduction mode). See mass_retrieval_tilelang_v2's
-        # group_max/exp_sum loop.
+        # Per-KV-head selection aggregated over the group's query-head scores.
+        # MUST stay a hard max: the TileLang candidates kernel selects with
+        # max over the group's q heads (envelope over views per head), and
+        # the backward kernels were built on that selection semantics.  The
+        # pre-2026-10-19 LSE-over-heads here diverged from the kernel for
+        # every GQA config (groups > 1) — same context, different chunks.
         Bq, Lq, _, Hq = scores_all.shape
         scores_grouped = scores_all.view(Bq, Lq, full_chunks, key_source.shape[2], groups)
-        if self.mass_config.score_reduction == "logsumexp":
-            grouped = self.mass_config.lse_temperature * torch.logsumexp(
-                scores_grouped / self.mass_config.lse_temperature, dim=-1
-            )
-        else:
-            grouped = scores_grouped.max(dim=-1).values
+        grouped = scores_grouped.max(dim=-1).values
         grouped = grouped.permute(0, 1, 3, 2)  # [B, L, Hkv, N]
         top_scores, top_idx = grouped.topk(k_eff, dim=-1)  # [B, L, Hkv, k_eff]
+        # The sparse-V kernel's min-merge counts each row's valid entries with
+        # a scan that breaks at the first negative index, so emit ascending
+        # valid indices and pad the tail with -1 (never 0) — same convention
+        # as the prefill side's mass_sort_selected_indices_kernel.
+        top_idx = torch.sort(top_idx, dim=-1).values
         if k_eff < self.topk:
-            pad = self.topk - k_eff
-            top_idx = F.pad(top_idx, (0, pad), value=0)
-            top_scores = F.pad(top_scores, (0, pad), value=float("-inf"))
+            top_idx = F.pad(top_idx, (0, self.topk - k_eff), value=-1)
         indices_hq = top_idx.repeat_interleave(groups, dim=2).clamp_min(0)
         gathered = torch.gather(
             scores_all.permute(0, 1, 3, 2), 3, indices_hq
         )  # [B, L, Hq, K]: gather along the chunk axis (dim 3 after permute)
-        if k_eff < self.topk:
-            gathered = F.pad(gathered, (0, self.topk - k_eff), value=float("-inf"))
+        # -1 slots gathered chunk-0 scores via clamp_min; zero their softmax
+        # mass in place (the old append-style pad overshot the topk length).
+        gathered = gathered.masked_fill(
+            top_idx.repeat_interleave(groups, dim=2).lt(0), float("-inf")
+        )
         # Early decode rows with no eligible chunk: kernel semantics yield a
         # SWA-only mixture (sparse mass zero). Gathered -inf scores produce a
         # zero softmax weight on every sparse branch, which matches.
@@ -663,7 +745,21 @@ class MASSAttention(HiLSAttention):
             return self.o_proj(output.to(self.o_proj.weight.dtype)), None
 
         key_source = hils_k_rope if self.apply_hils_rope else hils_k_nope
-        retrieval = self.build_mass_retrieval_plan(lmk_q, key_source)
+        if torch.is_grad_enabled():
+            retrieval = self.build_mass_retrieval_plan(lmk_q, key_source)
+        else:
+            # Inference: some (B, L) padding shapes occasionally fail TileLang
+            # layout inference and would otherwise kill the whole forward.
+            # Fall back to the exact reference math (validated against the
+            # kernel on the decode path) instead of crashing the eval run.
+            try:
+                retrieval = self.build_mass_retrieval_plan(lmk_q, key_source)
+            except Exception as e:
+                if not getattr(self, "_retrieval_fallback_logged", False):
+                    print(f"[mass-retrieval-fallback] kernel compile failed ({type(e).__name__}); "
+                          f"using reference path for this layer from now on.", flush=True)
+                    self._retrieval_fallback_logged = True
+                retrieval = self._reference_retrieval_prefill(lmk_q, key_source)
         scores = retrieval.selected_scores
         indices = retrieval.indices
         self.last_mass_anchor_load = retrieval.anchor_load

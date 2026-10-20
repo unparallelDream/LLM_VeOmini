@@ -29,6 +29,25 @@ _SORT_PASSES = {
 }
 
 
+class _LazyKernel:
+    """Compile a TileLang kernel on first call.
+
+    Backward-only kernels (dQ / dmu / partial / reduce) are wrapped so pure
+    forward passes (inference, eval) never pay their JIT cost — some inference
+    shapes cannot even pass free-mode layout inference for them, and eager
+    compilation inside the retrieval wrapper would crash the forward path.
+    """
+
+    def __init__(self, thunk):
+        self._thunk = thunk
+        self._kernel = None
+
+    def __call__(self, *args, **kwargs):
+        if self._kernel is None:
+            self._kernel = self._thunk()
+        return self._kernel(*args, **kwargs)
+
+
 @tilelang.jit(out_idx=[3], pass_configs=_PASSES)
 def mass_envelope_candidates_kernel(
     B,
@@ -104,15 +123,22 @@ def mass_envelope_candidates_kernel(
                         if (tq < L) and (n < N):
                             group_max = T.alloc_local([1], accum_dtype)
                             group_score = T.alloc_local([1], accum_dtype)
-                            group_max[0] = -T.infinity(accum_dtype)
-                            for m in T.serial(mp):
-                                value = planes_shared[l, nn * mp + m] * sm_scale + Bias[batch, n, h, m]
+                            # NOTE: mp is a compile-time constant, so this is a
+                            # Python-unrolled loop.  The previous T.serial(mp)
+                            # form silently collapsed to the last view (kernel
+                            # returned the m=mp-1 plane for BOTH max and LSE
+                            # modes, breaking every M>=2 envelope) — the serial
+                            # loop's accumulation over an alloc_local scalar
+                            # inside T.Parallel did not lower correctly.
+                            group_max[0] = planes_shared[l, nn * mp + 0] * sm_scale + Bias[batch, n, h, 0]
+                            for m_unrolled in range(1, mp):
+                                value = planes_shared[l, nn * mp + m_unrolled] * sm_scale + Bias[batch, n, h, m_unrolled]
                                 group_max[0] = T.max(group_max[0], value)
                             if use_logsumexp:
                                 exp_sum = T.alloc_local([1], accum_dtype)
-                                exp_sum[0] = 0.0
-                                for m in T.serial(mp):
-                                    value = planes_shared[l, nn * mp + m] * sm_scale + Bias[batch, n, h, m]
+                                exp_sum[0] = T.exp((planes_shared[l, nn * mp + 0] * sm_scale + Bias[batch, n, h, 0] - group_max[0]) / lse_temperature)
+                                for m_unrolled in range(1, mp):
+                                    value = planes_shared[l, nn * mp + m_unrolled] * sm_scale + Bias[batch, n, h, m_unrolled]
                                     exp_sum[0] += T.exp((value - group_max[0]) / lse_temperature)
                                 group_score[0] = group_max[0] + lse_temperature * T.log(exp_sum[0])
                             else:
@@ -288,16 +314,23 @@ def mass_selected_scores_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale, threads=1
                 winner = T.alloc_local([1], idx_dtype)
                 best[0], winner[0] = -T.infinity(accum_dtype), 0
                 if (n >= 0) and (n < N):
-                    for m in T.serial(M):
-                        dot = T.alloc_local([1], accum_dtype)
-                        dot[0] = 0.0
-                        for d in T.serial(D):
-                            dot[0] += T.Cast(accum_dtype, q_shared[g, d]) * T.Cast(
-                                accum_dtype, Mu[batch, n, h, m, d]
+                    # Both loops are Python-unrolled: ANY T.serial
+                    # accumulation over alloc_local scalars inside T.Parallel
+                    # fails to lower correctly (envelope collapse fixed
+                    # 2026-10-19; here the T.serial(D) dot-product collapsed
+                    # to the last element, verified mismatch ~1.6 vs ref).
+                    dot = T.alloc_local([1], accum_dtype)
+                    for m_unrolled in range(M):
+                        dot[0] = T.Cast(accum_dtype, q_shared[g, 0]) * T.Cast(
+                            accum_dtype, Mu[batch, n, h, m_unrolled, 0]
+                        )
+                        for d_unrolled in range(1, D):
+                            dot[0] = dot[0] + T.Cast(accum_dtype, q_shared[g, d_unrolled]) * T.Cast(
+                                accum_dtype, Mu[batch, n, h, m_unrolled, d_unrolled]
                             )
-                        value = dot[0] * sm_scale + Bias[batch, n, h, m]
+                        value = dot[0] * sm_scale + Bias[batch, n, h, m_unrolled]
                         if value > best[0]:
-                            best[0], winner[0] = value, m
+                            best[0], winner[0] = value, m_unrolled
                 Scores[batch, tq, h, k] = best[0]
                 Winners[batch, tq, h, k] = winner[0]
     return kernel
@@ -1046,26 +1079,36 @@ def mass_retrieval_tilelang_v2(
                 sm_scale=sm_scale,
                 per_qhead_lmks=True,
             ),
-            # dQ: block-diagonal gather-GEMM by default (29% of GPU kernel
-            # time in the 2026-10-10 trace came from the scalar kernel);
-            # MASS_DQ_LEGACY=1 restores it.
-            mass_selected_dq_gemm_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale)
-            if os.environ.get("MASS_DQ_LEGACY", "0") != "1"
-            else mass_selected_dq_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
-            mass_selected_dmu_dbias_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
-            # Partial accumulation: merged-tangent single launch by default;
-            # MASS_PARTIAL_LEGACY=1 restores the per-tangent kernels.
+            # dQ/partial 是 backward 专用 kernel,改为惰性编译:推理(以及任何
+            # 未反传的形状)不需要为它们付 JIT,也避免部分推理形状(batch 补尾
+            # 等)在布局推断下编译失败拖垮整个前向。
+            _LazyKernel(
+                lambda: (
+                    mass_selected_dq_gemm_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale)
+                    if os.environ.get("MASS_DQ_LEGACY", "0") != "1"
+                    else mass_selected_dq_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale)
+                )
+            ),
+            _LazyKernel(
+                lambda: mass_selected_dmu_dbias_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale)
+            ),
             (
-                mass_selected_partial_bwd_mt_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale),
+                _LazyKernel(
+                    lambda: mass_selected_partial_bwd_mt_kernel(B, L, N, H, Hkv, M, D, topk, sm_scale)
+                ),
             )
             if os.environ.get("MASS_PARTIAL_LEGACY", "0") != "1"
             else tuple(
-                mass_selected_partial_bwd_kernel(
-                    B, L, N, H, Hkv, M, D, topk, sm_scale, tangent
+                _LazyKernel(
+                    lambda t=tangent: mass_selected_partial_bwd_kernel(
+                        B, L, N, H, Hkv, M, D, topk, sm_scale, t
+                    )
                 )
                 for tangent in range(M)
             ),
-            mass_selected_partial_reduce_kernel(B, L, N, H, M, D),
+            _LazyKernel(
+                lambda: mass_selected_partial_reduce_kernel(B, L, N, H, M, D)
+            ),
         )
         _KERNEL_CACHE[cache_key] = kernels
     # The N-row partial path is being retained for kernel development, but the

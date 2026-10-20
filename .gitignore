@@ -24,3 +24,8 @@ cpt_olmo3_8KA2K_HoPE_qcal_test.sh
 .pytest_cache/**
 **/trace/**
 **/*.distcp
+
+# 本机共享资产软链（LLM_VeOmni 专用）
+outputs
+logs
+.cache

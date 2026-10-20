@@ -2,10 +2,10 @@
 
 Reuses prompt templates, metrics and middle-truncation from
 ``eval_longbench_v1``; model loading reuses the adapter loaders from
-``eval_ruler_qwen_mass_bsa_4k``.  Generation runs with
-``auto_insert_lmk=True`` so the model inserts chunk-end landmarks on prefill
-exactly like training-time layout (identical insert_special_tokens +
-position compensation).
+``eval_ruler_qwen_mass_bsa_4k``.  Generation relies on the model's
+generate-time chunk-end landmark insertion (gated by ``insert_landmarks``;
+the HiLS prepare_inputs_for_generation path inserts on prefill exactly like
+the training-time layout).
 
 English F1/classification subset only (no jieba/rouge deps in env):
 narrativeqa qasper multifieldqa_en hotpotqa 2wikimqa musique triviaqa trec.
@@ -99,10 +99,6 @@ def main() -> None:
     torch.manual_seed(args.seed)
     loader = load_mass_lora_model if args.variant == "mass_lora" else load_hils_lora_model
     model, load_metadata = loader(_Args(args.variant, args.mass_config, args.mass_model, args.checkpoint))
-    # 生成路径需要模型自行在 prefill 插 landmark(与训练期插入语义一致)
-    model.config.auto_insert_lmk = True
-    if hasattr(model, "auto_insert_lmk"):
-        model.auto_insert_lmk = True
     tokenizer = AutoTokenizer.from_pretrained(args.original_model, trust_remote_code=True)
 
     results = {}

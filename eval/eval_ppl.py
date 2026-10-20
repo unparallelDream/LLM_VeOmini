@@ -304,8 +304,6 @@ def build_eval_model(args, device, tp_size=1, use_hf_tp=False, use_veomni_tp=Fal
             hf_kwargs["device_map"] = device
         if args.config_path:
             config = load_eval_config(args.config_path, args.checkpoint_path)
-            if args.insert_lmk and hasattr(config, "auto_insert_lmk"):
-                config.auto_insert_lmk = False
             model = AutoModelForCausalLM.from_pretrained(
                 args.checkpoint_path,
                 config=config,
@@ -316,11 +314,6 @@ def build_eval_model(args, device, tp_size=1, use_hf_tp=False, use_veomni_tp=Fal
                 args.checkpoint_path,
                 **hf_kwargs,
             )
-        if args.insert_lmk:
-            if hasattr(model, "auto_insert_lmk"):
-                model.auto_insert_lmk = False
-            if hasattr(model, "config"):
-                model.config.auto_insert_lmk = False
         return model
 
     if not args.config_path:
@@ -329,6 +322,7 @@ def build_eval_model(args, device, tp_size=1, use_hf_tp=False, use_veomni_tp=Fal
     model = build_foundation_model(
         config_path=args.config_path,
         torch_dtype="bfloat16",
+        attn_implementation=attn_implementation,
     )
 
     if args.checkpoint_path:

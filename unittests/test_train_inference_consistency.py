@@ -199,12 +199,9 @@ def run_forward_baseline_plain(model, input_ids, generated_ids, device):
     full_ids = torch.cat([input_ids, generated_ids.unsqueeze(0)], dim=1)
     print(f"  [Forward] original sequence length: {full_ids.shape[1]} (prompt={prompt_len}, gen={gen_len})")
 
-    saved_auto_insert_lmk = model.auto_insert_lmk
-    model.auto_insert_lmk = False
     model._gen_state.reset()
     with torch.no_grad():
         outputs = model(input_ids=full_ids, use_cache=True)
-    model.auto_insert_lmk = saved_auto_insert_lmk
 
     logits = outputs.logits
     pred_logits = logits[:, prompt_len - 1 : prompt_len + gen_len - 1, :].squeeze(0)
@@ -227,8 +224,6 @@ def run_forward_baseline_plain_batch(model, input_ids, attention_mask, generated
         f"(padded_prompt={prompt_len}, gen={gen_len})"
     )
 
-    saved_auto_insert_lmk = model.auto_insert_lmk
-    model.auto_insert_lmk = False
     model._gen_state.reset()
     forward_kwargs = {
         "input_ids": full_ids,
@@ -245,7 +240,6 @@ def run_forward_baseline_plain_batch(model, input_ids, attention_mask, generated
 
     with torch.no_grad():
         outputs = model(**forward_kwargs)
-    model.auto_insert_lmk = saved_auto_insert_lmk
 
     logits = outputs.logits
     pred_logits = logits[:, prompt_len - 1 : prompt_len + gen_len - 1, :]
@@ -280,10 +274,8 @@ def run_forward_baseline(model, tokenizer, input_ids, generated_ids, device):
     print(f"  [Forward] LMK count: {num_lmk}, non-LMK count: {num_non_lmk}")
     assert num_non_lmk == full_len, f"non-LMK count {num_non_lmk} != original sequence length {full_len}"
 
-    saved_auto_insert_lmk = model.auto_insert_lmk
     saved_gen_state_active = model._gen_state.active
     saved_lmk_positions = model._gen_state.lmk_positions_in_input
-    model.auto_insert_lmk = False
     model._gen_state.active = False
     model._gen_state.lmk_positions_in_input = None
 
@@ -295,7 +287,6 @@ def run_forward_baseline(model, tokenizer, input_ids, generated_ids, device):
             attention_mask=None,
         )
 
-    model.auto_insert_lmk = saved_auto_insert_lmk
     model._gen_state.active = saved_gen_state_active
     model._gen_state.lmk_positions_in_input = saved_lmk_positions
 
@@ -700,27 +691,20 @@ def main(args):
         print(f"       config_path: {args.config_path}")
         print(f"       checkpoint_path: {args.checkpoint_path}")
         config = AutoConfig.from_pretrained(args.config_path)
-        config.auto_insert_lmk = args.auto_insert_lmk
         load_kwargs = {**model_kwargs, "config": config, "device_map": device}
-        if args.auto_insert_lmk:
-            load_kwargs["auto_insert_lmk"] = True
         model = AutoModelForCausalLM.from_pretrained(args.checkpoint_path, **load_kwargs)
     elif args.checkpoint_path:
         print(f"[INFO] Loading model (from_pretrained): {args.checkpoint_path}")
         load_kwargs = {**model_kwargs, "device_map": device}
-        if args.auto_insert_lmk:
-            load_kwargs["auto_insert_lmk"] = True
         model = AutoModelForCausalLM.from_pretrained(args.checkpoint_path, **load_kwargs)
     else:
         assert args.config_path is not None, "When --checkpoint_path is not specified, --config_path must be provided (from_config random initialization)"
         print(f"[INFO] Loading model (from_config): {args.config_path}")
         config = AutoConfig.from_pretrained(args.config_path)
-        config.auto_insert_lmk = args.auto_insert_lmk
         model = AutoModelForCausalLM.from_config(config, **model_kwargs).to(device)
 
     model.eval()
     print(f"[INFO] Model loaded, chunk_size={model.chunk_size}, lmk_id={model.lmk_id}")
-    print(f"[INFO] auto_insert_lmk={model.auto_insert_lmk}")
     print(f"[INFO] Model parameter count: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
 
     prompts = args.prompts if args.prompts else [
@@ -798,10 +782,6 @@ if __name__ == "__main__":
             "When only this is specified: from_config random initialization; "
             "When specified together with --checkpoint_path: build graph from this config, load weights from checkpoint"
         ),
-    )
-    parser.add_argument(
-        "--auto_insert_lmk", action="store_true",
-        help="Consistent with eval/eval_ppl_hf.py: passed as a constructor argument for from_pretrained; written to config.auto_insert_lmk for from_config",
     )
     parser.add_argument(
         "--tokenizer_path", type=str, default=None,

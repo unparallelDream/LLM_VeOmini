@@ -293,12 +293,6 @@ def hils_causal_lm_forward(
                 labels = torch.roll(labels, shifts=1, dims=-1)
             else:
                 labels = insert_special_tokens(labels, -100, self.chunk_size)
-    elif self.insert_landmarks and self.auto_insert_lmk and not self._gen_state.active:
-        position_ids = create_position_ids_with_landmarks(position_ids, input_ids.shape[1], self.chunk_size, input_ids.device)
-        input_ids = insert_special_tokens(input_ids, self.lmk_id, self.chunk_size)
-        new_seq_len = input_ids.shape[1]
-        pos_indices = torch.arange(new_seq_len, device=input_ids.device)
-        non_lmk_mask = ~(pos_indices % self.chunk_size == self.chunk_size - 1)
 
     outputs: BaseModelOutputWithPast = self.model(
         input_ids=input_ids,

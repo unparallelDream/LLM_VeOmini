@@ -788,7 +788,6 @@ class HiLSForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
     def __init__(self, config, **kwargs):
-        auto_insert_lmk = kwargs.pop('auto_insert_lmk', None)
         super().__init__(config)
         self.model = HiLSModel(config)
         self.vocab_size = get_model_vocab_size(config)
@@ -797,7 +796,6 @@ class HiLSForCausalLM(Qwen3PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, self.vocab_size, bias=False)
         self.insert_landmarks = getattr(config, 'insert_landmarks', True)
         self.adjust_lmk_pos = getattr(config, "adjust_lmk_pos", self.insert_landmarks)
-        self.auto_insert_lmk = auto_insert_lmk if auto_insert_lmk is not None else getattr(config, 'auto_insert_lmk', False)
 
         self._gen_state = GenerateState()
 

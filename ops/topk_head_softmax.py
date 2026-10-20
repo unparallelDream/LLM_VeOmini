@@ -1291,12 +1291,16 @@ def online_softmax_topk_head(
             ``G == 1``  K path( GQA/MQA);``G > 1``  per-q-head path,
              ``lmks.shape[2] == q.shape[2] == h_q``, ``h_kv = h_q // G``,
             topk in ``h_kv`` (max over G).
+            ``None`` is treated as ``1`` (legacy callers passed None for the
+            per-KV-head path, which must not fall into the per-q-head branch).
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: (indices, scores)
         - indices: [B, L, h_kv, topk], ( KV head )
         - scores: [B, L, h_q, topk], of raw scaled qk scores
     """
+    if G is None:
+        G = 1
 
     if q.dim() == 4:
         B, L, h_q, D = q.shape
@@ -1985,7 +1989,7 @@ def test_train_inference_correctness(test_name, B, q_len, kv_len, h_kv, G, D, to
     else:
         gumbel_noise = None
 
-    G_arg = G if per_qhead_lmks else None
+    G_arg = G if per_qhead_lmks else 1
 
     print("\n--- Forward Pass ---")
 
@@ -2119,7 +2123,7 @@ def test_drop_mask_correctness(per_qhead_lmks: bool = False):
     lmks_ref = lmks_raw.clone().detach().requires_grad_(True)
     lse_swa = lse_swa_raw.clone().detach()
 
-    G_arg = G if per_qhead_lmks else None
+    G_arg = G if per_qhead_lmks else 1
 
     # ============ Forward ============
     print("\n--- Forward Correctness ---")

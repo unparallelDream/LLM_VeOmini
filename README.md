@@ -1,279 +1,94 @@
-# HiLS-Attention: Hierarchical Sparse Attention Done Right
+# LLM_VeOmni
 
-Official code for the paper [Hierarchical Sparse Attention Done Right: Toward Infinite Context Modeling](https://arxiv.org/abs/2607.02980).
+基于 VeOmni 训练框架的 LLM 机制研究与扩展工作仓库。两条主线：
 
-<p align="center">
-  <a href="https://arxiv.org/abs/2607.02980"><img src="https://img.shields.io/badge/arXiv-2607.02980-b31b1b?logo=arxiv" alt="arXiv"></a>
-  <a href="https://github.com/Tencent-Hunyuan/HiLS-Attention"><img src="https://img.shields.io/badge/GitHub-HiLS--Attention-181717?logo=github&logoColor=white" alt="GitHub"></a>
-  <a href="https://huggingface.co/tencent/HiLS-Attention-7B/tree/main"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-HiLS--Attention--7B-ffcc4d" alt="Hugging Face"></a>
-</p>
+1. **上游线（HiLS / MASS）**：来自 [HiLS-Attention](https://github.com/Tencent-Hunyuan/HiLS-Attention)（论文 [arXiv:2607.02980](https://arxiv.org/abs/2607.02980)）的分层稀疏注意力 / 多锚点检索（MASS）训练与评测全栈，含 TileLang 内核；
+2. **扩展线（GatedMLAHybrid，本仓库新增）**：从 LLM_Standardization（flame 栈）迁移并扩展的 gated_mla 模型族——**iHC/mHC 超连接、MoE（E8/E10/E16）、KDA 混合、规模扩展四档**，全部经冒烟验证。
 
-HiLS-Attention is a chunk-wise sparse attention mechanism that learns chunk selection end-to-end under the language-modeling loss, enabling native sparse training for efficient long-context modeling.
+> 环境约定：conda 环境 `hils_smoke_py311`（torch 2.6.0+cu124 / triton 3.2 / veomni）；fla 已装入（`--no-deps`，KDA 训练需 `FLA_TILELANG=0` + 纯 bf16）。
 
+## 文件结构
 
+```
+LLM_VeOmni/
+├── models/                          # 模型实现与 VeOmni 注册（MODELING/MODEL_CONFIG_REGISTRY）
+│   ├── GatedMLAHybrid/              # ★ 扩展线模型族
+│   │   ├── configuration_gated_mla_hybrid.py   # 配置：iHC/mHC/MoE 字段 + 三条硬约束校验
+│   │   │                                       #   (hidden=heads×head_dim, nope+rope=head_dim, heads×v_head=hidden)
+│   │   └── modeling_gated_mla_hybrid.py        # 建模：GatedMLA/SWA/HiLS占位/KDA 注意力
+│   │                                           #   + IdentityHyperConnection / ManifoldHyperConnection
+│   │                                           #   + MoEFFN(top-k路由+负载均衡损失) + DynamicCache 协议适配
+│   ├── FlashHiLS/                   # 上游：HiLS 注意力（qwen/olmo 两个 modeling + hils_forward）
+│   ├── MASSIndex/                   # 上游：MASS 多锚检索（mass_attention/mass_retrieval 内核接口）
+│   ├── FullAttn/ NSA/ DASHATTN/ HSA_Ultralong/ INFLLMV2/   # 上游：对照模型族
+│   └── __init__.py                  # 注册入口（含 GatedMLAHybrid 导入；与上游同步时的豁免文件）
+│
+├── configs/
+│   ├── gated_mla_hybrid/            # ★ 扩展线 config 矩阵（全部冒烟通过）
+│   │   ├── gated_mla_50m.json       # 基线（50M, d384×16L, 6×64）
+│   │   ├── {swa,hils,kda}_gated_mla_50m.json       # 混合注意力变体（4 线性层/16）
+│   │   ├── {ihc,ihc_n2,mhc}_gated_mla_50m.json     # 超连接变体
+│   │   ├── gated_mla_{150m,400m,1b,1p8b}.json      # 密集扩展四档
+│   │   ├── gated_mla_{150m,400m,1b}_moe*.json      # MoE（E8 默认 / _e10 / _e16）
+│   │   └── kda_gated_mla_{50m,150m}_moe.json       # KDA×MoE 组合
+│   │   └── llama32k_tokenizer/      # 32K 词表 tokenizer
+│   ├── mass_attention/ hils_attention/ naive_bsa/ nsa/ ...   # 上游各模型族配置
+│   ├── training_recipes/            # VeOmni 训练 recipe YAML（fsdp2 等正式配方）
+│   └── archive_qwen_small_scale/ olmo3_200M_cpt/ olmo3_7B/ olmo3_vocab/ ...
+│
+├── tasks/                           # VeOmni 训练任务入口
+│   ├── pretrain_gated.py            # ★ gated_mla_hybrid 预训练（plaintext 管线；DDP-MP/纯bf16/fsdp2
+│   │                                #   三种精度路径；GATED_PURE_BF16/FLA_TILELANG 开关）
+│   └── pretrain_with_ruler.py / pretrain_mass_with_ruler.py / mass_profile_entry.py   # 上游 RULER 任务
+│
+├── scripts/
+│   ├── gated_mla_smoke.sh           # ★ 冒烟/训练启动（CONFIG/GPU/STEPS/SEED/DP_MODE/WARMUP/SAVE_* 可覆盖）
+│   ├── sync_from_hils.sh            # ★ 上游同步（--dry-run 预览；豁免 models/__init__.py 与 .gitignore）
+│   └── eval/ cpt/ mass/ mid_train/ bench/ ...   # 上游脚本
+│
+├── ops/                             # TileLang/Triton 内核：HiLS/MASS 检索（flex_attn、mass_retrieval_v2、
+│                                   #   topk_head_softmax 等；上游 10 月 kernel 修复已同步）
+├── eval/                            # 评测：RULER / ppl 阶梯 / lm-eval / longbench / 对比分析
+├── scripts_zem/                     # 实验启动脚本（含上游同步进来的 olmo200m 三臂续训 launch 系列）
+├── unittests/ tests/                # 单测（MASS envelope、topk、训练推理一致性等）
+├── docs_experiments/                # 实验文档
+│   ├── MODEL_SCALING_AND_MOE_GUIDE_20261019.md   # ★ 扩展与 MoE 指南（扩展表/每专家参数/显存预算/路线图）
+│   ├── hils_paper_arxiv_2607.02980.pdf           # 上游 HiLS 论文
+│   └── DESIGN_SPEC_shared_expert.md / EVAL_* / MULTI_ANCHOR_* ...
+├── utils/                           # 冻结参数、参数组、trainable checkpointer 等训练工具
+├── data/ preprocess/                # veomni 数据管线代码与预处理
+├── results/ assets/                 # 结果与图示
+├── PROGRESS_*.md / KERNEL_ACCEL_REPORT.md          # 上游进度与内核加速报告
+├── train.sh / train_dist.sh         # torchrun 启动器（单机/多机）
+├── pyproject.toml / uv.lock / requirements.txt     # 依赖声明
+├── outputs logs .cache              # → 本机共享资产软链（已 gitignore，不进版本库）
+└── tmp/                             # 冒烟/消融产物（gitignore）
+```
 
-![HiLS-Attention Overview](./assets/hils_attn_overview.png)
-
-*Figure: Overview of HiLS-Attention. Naive block sparse attention selects top-k chunks by their exact chunk mass, but computing all chunk masses requires full QK computation. HiLS-Attention instead uses compressed chunk keys to estimate a chunk-mass surrogate and factorizes attention into inter-chunk and intra-chunk softmax, enabling end-to-end learning from the next-token prediction loss.*
-
-## Performance
-
-![HiLS-Attention Performance](./assets/performances.png)
-
-*Figure: After only 50B continued-training tokens, HiLS-Attention inherits the capability of full attention while bringing two key advantages: **strong ultra-long context extrapolation** beyond the YaRN-extended 4× length (a) and **faster inference** (b). Meanwhile, it preserves comparable performance for short- and medium-context tasks, within both the original training length and the YaRN-extrapolated range (c & d).*
-
-## TODO
-
-We are actively working on releasing more resources. Stay tuned!
-
-- [x] Release training and evaluation code
-- [x] Release pre-trained model checkpoints
-- [x] Release SGLang inference code for efficient long-context serving
-
-## Environment Setup
-
-### Install via uv (recommended)
+## 快速开始
 
 ```bash
-git clone https://github.com/Tencent-Hunyuan/HiLS-Attention.git
-cd HiLS-Attention
+# gated_mla_hybrid 冒烟（2 步 + HF 导出）
+GPU=1 CONFIG=configs/gated_mla_hybrid/gated_mla_50m.json bash scripts/gated_mla_smoke.sh
 
-# install uv
-curl -LsSf https://astral.sh/uv/install.sh | sh
+# 换任意 config：MoE / KDA×MoE / iHC / mHC / 扩展档
+GPU=1 CONFIG=configs/gated_mla_hybrid/gated_mla_400m_moe.json bash scripts/gated_mla_smoke.sh
 
-uv sync
-source .venv/bin/activate
+# 短程训练（500 步，含 warmup/保存控制）
+GPU=4 CONFIG=... STEPS=500 WARMUP=0.03 SEED=42 SAVE_STEPS=500 bash scripts/gated_mla_smoke.sh
+
+# 单卡 fp32-master 路径（bf16 计算 + fp32 主权重）
+DP_MODE=ddp GATED_PURE_BF16=0 bash scripts/gated_mla_smoke.sh
 ```
 
-### Install via pip
+## 与上游的同步
+
+上游 `HiLS-Attention-main`（本地目录）持续演进时：
 
 ```bash
-git clone https://github.com/Tencent-Hunyuan/HiLS-Attention.git
-cd HiLS-Attention
-
-conda create -n hils python=3.11 -y
-conda activate hils
-
-pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
-pip install -r requirements.txt
+bash scripts/sync_from_hils.sh --dry-run   # 预览差异
+bash scripts/sync_from_hils.sh             # 拉入更新/新增，同步删除；豁免本仓库自维护文件
 ```
 
-
-
-## Training
-
-
-
-### Training from Scratch
-
-```bash
-export CORPUS_PATH=/path/to/tokenized/data
-export OUTPUT_DIR=outputs/checkpoints/hils_attn_8KA2K_HoPE_345M_prop3p1_qcal_r64
-bash scripts/pretrain/345M_exp_dist/pretrain_hils_attn_8KA2K_HoPE_345M_prop3p1_qcal_r64.sh
-```
-
-
-
-### Continue Pre-Training
-
-```bash
-export MODEL_PATH=/path/to/base/hf_ckpt
-export CORPUS_PATH=/path/to/tokenized/data
-export OUTPUT_DIR=outputs/checkpoints/olmo3_8KA2K_HoPE_qcal
-bash scripts/cpt/cpt_olmo3_8KA2K_HoPE_qcal.sh
-```
-
-For landmark-token tuning, use `MODEL_PATH` to point to the base checkpoint directory:
-
-```bash
-export MODEL_PATH=/path/to/base/checkpoint
-export CORPUS_PATH=/path/to/tokenized/data
-export OUTPUT_DIR=outputs/checkpoints/olmo3_8KA2K_lmk_token_tuning
-bash scripts/cpt/cpt_olmo3_8KA2K_lmk_token_tuning.sh
-```
-
-
-
-## Evaluation
-
-
-
-### Checkpoint Format
-
-Training saves distributed checkpoints (DCP). The PPL and RULER examples below load DCP checkpoints directly. HF conversion is only needed for HuggingFace-based generation or evaluation.
-
-Convert DCP to HF format when needed:
-
-```bash
-DCP_PATH=/path/to/checkpoints/global_step_xxx \
-bash scripts/ckpt_transfer/dcp_hf_transfer.sh
-```
-
-The converted checkpoint is saved under:
-
-```text
-/path/to/checkpoints/global_step_xxx/hf_ckpt
-```
-
-
-
-### Perplexity Evaluation
-
-```bash
-python eval/eval_ppl.py \
-  --config_path configs/hils_attention/config_hils_attn_8KA2K_HoPE_345M_prop3p1_qcal_r64.json \
-  --checkpoint_path /path/to/checkpoints/global_step_30000 \
-  --use_dcp_checkpoint \
-  --data_path /path/to/tokenized/eval/data \
-  --max_seq_len 8192 \
-  --last_k_tokens 512  # compute PPL on the last 512 tokens only
-```
-
-
-
-### RULER Evaluation
-
-```bash
-python eval/eval_ruler.py \
-  --config_path configs/hils_attention/config_hils_attn_8KA2K_HoPE_345M_prop3p1_qcal_r64.json \
-  --checkpoint_path /path/to/checkpoints/global_step_30000 \
-  --corpus_path /path/to/tokenized/eval/data \
-  --max_seq_len 8192 \
-  --task_id 0  # 0: S-N, 1: MK-MQ, 2: VT
-```
-
-
-
-### OLMo3 7B Evaluations
-
-OLMo3-7B evaluations use **HF checkpoints** (`global_step_xxx/hf_ckpt`) and the Olmo3 tokenizer under `configs/olmo3_vocab/`. Convert DCP checkpoints first (see [Checkpoint Format](#checkpoint-format) above).
-
-Each batch script lives under `scripts/eval/`. Edit the `MODELS` / `MODEL_NAMES` block at the top of the script to point to your checkpoint and HiLS config (`configs/olmo3_7B/*.json`). Logs are written to `scripts/eval/logs/`.
-
-#### 1. LongBench v1 (long-context QA)
-
-```bash
-bash scripts/eval/eval_olmo3_longbench_v1.sh
-```
-
-
-| Setting      | Default           | Notes                                                               |
-| ------------ | ----------------- | ------------------------------------------------------------------- |
-| `MAX_LENGTH` | `65536`           | Max input length (middle truncation)                                |
-| `DATASETS`   | all 21 tasks      | Set comma-separated names to run a subset, e.g. `"hotpotqa,qasper"` |
-| `GPU_IDS`    | `0 1 2 3 4 5 6 7` | One GPU per model; jobs are queued automatically                    |
-
-
-Per-task predictions and scores are saved under `scripts/eval/logs/eval_longbench_v1_<timestamp>/<model_name>/`.
-
-#### 2. OpenCompass (short-context benchmarks)
-
-11 benchmarks covering knowledge, reasoning, and code. Uses the Transformers backend with a multi-GPU job queue (one dataset per GPU by default).
-
-**One-time setup** — clone [OpenCompass](https://github.com/open-compass/opencompass) and install:
-
-```bash
-git clone https://github.com/open-compass/opencompass.git scripts/eval/opencompass
-bash scripts/eval/install_opencompass.sh
-export OPENCOMPASS_PATH=scripts/eval/opencompass
-export PYTHONPATH=$PWD:$OPENCOMPASS_PATH:$PYTHONPATH
-```
-
-**Run:**
-
-```bash
-bash scripts/eval/eval_olmo3_opencompass.sh
-```
-
-
-| Benchmark                                 | Type                  |
-| ----------------------------------------- | --------------------- |
-| MMLU, GPQA, HellaSwag, ARC-c, BoolQ, RACE | Few-shot PPL          |
-| GSM8K, CMath                              | Math generation (CoT) |
-| HumanEval+, MBPP+, CRUXEval-O             | Code generation       |
-
-
-Results land in `scripts/eval/logs/eval_olmo3_opencompass_<timestamp>/`. A LaTeX summary table is written to `summary.log`. HumanEval+ / MBPP+ are re-scored with `evalplus` after inference.
-
-For MBPP+, place the evalplus-format jsonl at `data/mbpp_plus/mbpp_plus.jsonl` (see `eval/configs/datasets/mbpp_plus_gen.py`).
-
-#### 3. PPL + RULER (long-context probing)
-
-Batch PPL and RULER over multiple sequence lengths. PPL uses Dolma3 tokenized data; RULER runs tasks 0 (S-N), 1 (MQ-N), and 2 (VT).
-
-```bash
-# both PPL and RULER (default)
-bash scripts/eval/eval_olmo3_ruler_ppl.sh
-
-# PPL only or RULER only
-EVAL_MODE=ppl  bash scripts/eval/eval_olmo3_ruler_ppl.sh
-EVAL_MODE=ruler bash scripts/eval/eval_olmo3_ruler_ppl.sh
-```
-
-
-| Setting                                 | Default                                           | Notes                                        |
-| --------------------------------------- | ------------------------------------------------- | -------------------------------------------- |
-| PPL lengths                             | 64 … 256K                                         | Skips lengths ≤ `chunk_size` for HiLS models |
-| RULER lengths                           | 8K, 16K, 32K, 128K                                |                                              |
-| `PPL_DATA_PATH`                         | `../../data/dolma3_mix-6T-1025-partial-tokenized` | Tokenized eval corpus                        |
-| `PPL_LAST_K_TOKENS`                     | `512`                                             | PPL computed on last 512 tokens only         |
-| `PPL_MAX_SAMPLES` / `RULER_MAX_SAMPLES` | `100` / `50`                                      |                                              |
-
-
-Logs and a LaTeX summary (`summary.log`) are saved to `scripts/eval/logs/eval_olmo3_<mode>_<timestamp>/`.
-
-## Efficient Inference with SGLang
-
-HiLS-Attention has a native [SGLang](https://github.com/sgl-project/sglang) serving
-backend that implements the hierarchical sparse attention as a first-class attention
-backend, so the released checkpoints (e.g. [HiLS-Attention-7B](https://huggingface.co/tencent/HiLS-Attention-7B))
-can be served with the standard SGLang server and OpenAI-compatible API, and enjoy
-HiLS-Attention's long-context speedups over dense attention (increasing with sequence
-length). The backend is closely aligned with the reference model.
-
-The backend lives here: **[alexzms/SGLang-HiLS](https://github.com/alexzms/SGLang-HiLS)**.
-See its [HSA README](https://github.com/alexzms/SGLang-HiLS/blob/main/python/sglang/srt/layers/attention/hsa/README.md)
-for full environment, config, and benchmark details.
-
-### Quick start
-
-```bash
-# 1. Install SGLang-HiLS (SGLang with the HSA backend)
-git clone https://github.com/alexzms/SGLang-HiLS.git
-cd SGLang-HiLS && pip install -e "python[all]"
-# HSA selection kernels also require `tilelang` (see the fork's HSA README).
-
-# 2. Download the released checkpoint
-huggingface-cli download tencent/HiLS-Attention-7B --local-dir ./HiLS-Attention-7B
-
-# 3. Convert the checkpoint for SGLang (translates config.json; weights are symlinked)
-python scripts/convert_hils_checkpoint.py \
-    --src ./HiLS-Attention-7B --dst ./HiLS-Attention-7B-sglang
-
-# 4a. Serve (OpenAI-compatible API on http://localhost:30000)
-python -m sglang.launch_server --model-path ./HiLS-Attention-7B-sglang \
-    --attention-backend hsa --page-size 64 --trust-remote-code
-
-# 4b. Or run offline on your own prompts
-python scripts/run_hsa_infer.py --model-path ./HiLS-Attention-7B-sglang \
-    "The capital of France is" "Water is made of hydrogen and"
-```
-
-> `--page-size` **must** equal the model's `chunk_size` (64). The backend
-> auto-configures the required HSA serving constraints (single-sequence prefill;
-> overlap scheduler disabled) — no extra flags needed.
-
-## Citation
-
-```bibtex
-@misc{hu2026hierarchicalsparseattentionright,
-      title={Hierarchical Sparse Attention Done Right: Toward Infinite Context Modeling}, 
-      author={Xiang Hu and Xinyu Wei and Hao Gu and Minshen Zhang and Tian Liang and Huayang Li and Lei Zhu and Yan Wang and Sirui Han and Yushi Bai and Kewei Tu and Haitao Mi and Leo Liang},
-      year={2026},
-      eprint={2607.02980},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2607.02980}, 
-}
-```
-
+扩展线的机制细节、扩展配置表、每专家参数、显存预算与路线图见
+**[docs_experiments/MODEL_SCALING_AND_MOE_GUIDE_20261019.md](docs_experiments/MODEL_SCALING_AND_MOE_GUIDE_20261019.md)**。

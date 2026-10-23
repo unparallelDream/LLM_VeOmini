@@ -303,6 +303,101 @@ class SlidingWindowAttention(nn.Module):
         return output, (k, v) if use_cache else None
 
 
+class GQAAttention(nn.Module):
+    """Grouped-query baseline (Qwen3.8-FlashNext / MiniMax-M3 style config):
+    few KV heads + per-head QK RMSNorm + partial RoPE on the first rope
+    channels. Shares the family's sink+window mask and output gate so the
+    ONLY variable vs GatedMLA is the KV organization (grouped full-dim vs
+    shared low-rank latent). Cache stores KV-head-level (k, v) [B,KV,S,D]."""
+
+    def __init__(self, config: GatedMLAHybridConfig):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_key_value_heads
+        self.head_dim = config.head_dim
+        self.rope_dim = config.qk_rope_head_dim
+        self.rope_theta = config.rope_theta
+        self.window_size = config.window_size
+        self.sink_size = config.attention_sink_size if config.attention_sink else 0
+        d = config.hidden_size
+        self.q_proj = nn.Linear(d, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(d, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(d, self.num_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, d, bias=False)
+        self.q_norm = RMSNorm(self.head_dim, config.norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, config.norm_eps)
+        self.output_gate = VectorOutputGate(d, config.output_gate_init)
+        self.sink_logits = nn.Parameter(torch.zeros(self.sink_size)) if self.sink_size else None
+        group = torch.repeat_interleave(
+            torch.arange(self.num_kv_heads), self.num_heads // self.num_kv_heads
+        )
+        self.register_buffer("kv_group", group, persistent=False)
+
+    def forward(
+        self,
+        hidden_states,
+        use_cache=False,
+        past_key_value=None,
+        position_ids=None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        batch, q_len, _ = hidden_states.shape
+        q = self.q_norm(
+            self.q_proj(hidden_states).view(batch, q_len, self.num_heads, self.head_dim)
+        )
+        k = self.k_norm(
+            self.k_proj(hidden_states).view(batch, q_len, self.num_kv_heads, self.head_dim)
+        )
+        v = self.v_proj(hidden_states).view(batch, q_len, self.num_kv_heads, self.head_dim)
+        if position_ids is None:
+            position_ids = torch.arange(q_len, device=hidden_states.device).unsqueeze(0).expand(batch, -1)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        if past_key_value is not None:
+            k = torch.cat((past_key_value[0], k), dim=2)
+            v = torch.cat((past_key_value[1], v), dim=2)
+        # cache holds PRE-rope k (GatedMLA semantics: re-rotate the full
+        # sequence every step, so the rope helper sees kv_len positions)
+        cache = (k, v) if use_cache else None
+        kv_len = k.shape[2]
+        if self.rope_dim > 0:
+            # partial RoPE on the first rope channels, mirroring GatedMLA's usage
+            q_rot, _ = _apply_rope(
+                q[..., : self.rope_dim],
+                torch.zeros_like(q[..., : self.rope_dim]),
+                position_ids,
+                self.rope_theta,
+            )
+            k_t = k.transpose(1, 2)
+            _, k_rot = _apply_rope(
+                k_t.new_zeros(batch, kv_len, self.num_kv_heads, self.rope_dim),
+                k_t[..., : self.rope_dim],
+                torch.arange(kv_len, device=hidden_states.device).unsqueeze(0).expand(batch, -1),
+                self.rope_theta,
+            )
+            q = torch.cat((q_rot, q[..., self.rope_dim:]), dim=-1)
+            k = torch.cat((k_rot, k_t[..., self.rope_dim:]), dim=-1).transpose(1, 2)
+        # expand KV heads to query heads, then attend
+        k_exp = k[:, self.kv_group]
+        v_exp = v[:, self.kv_group]
+        q_t = q.transpose(1, 2)
+        mask = _attention_bias(
+            q_len,
+            k.shape[2],
+            hidden_states.device,
+            q_t.dtype,
+            self.window_size,
+            self.sink_size,
+            self.sink_logits,
+            attention_mask,
+        )
+        output = F.scaled_dot_product_attention(q_t, k_exp, v_exp, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        output = output.transpose(1, 2).reshape(batch, q_len, -1)
+        output = self.output_gate(hidden_states, self.o_proj(output))
+        return output, cache
+
+
 class HiLSAttention(SlidingWindowAttention):
     """Reference local/global path; optimized HiLS kernels can replace this module."""
 
@@ -533,6 +628,8 @@ class HybridBlock(nn.Module):
                 self.attn = HiLSAttention(config)
             else:
                 self.attn = SlidingWindowAttention(config)
+        elif config.baseline == "gated_gqa":
+            self.attn = GQAAttention(config)
         else:
             self.attn = GatedMLA(config)
         self.mlp = MoEFFN(config) if config.num_experts > 1 else SwiGLU(config)

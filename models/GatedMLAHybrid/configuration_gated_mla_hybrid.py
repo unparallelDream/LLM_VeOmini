@@ -12,6 +12,7 @@ class GatedMLAHybridConfig(PretrainedConfig):
 
     BASELINES = {
         "gated_mla": (),
+        "gated_gqa": (),
         "hils_gated_mla": (3, 7, 11, 15),
         "kda_gated_mla": (3, 7, 11, 15),
         "swa_gated_mla": (3, 7, 11, 15),
@@ -23,6 +24,7 @@ class GatedMLAHybridConfig(PretrainedConfig):
         hidden_size: int = 384,
         num_hidden_layers: int = 16,
         num_attention_heads: int = 6,
+        num_key_value_heads: int = 2,
         head_dim: int = 64,
         intermediate_size: int = 1536,
         baseline: str = "gated_mla",
@@ -76,6 +78,8 @@ class GatedMLAHybridConfig(PretrainedConfig):
         linear_layer_indices = list(linear_layer_indices)
         if any(i < 0 or i >= num_hidden_layers for i in linear_layer_indices):
             raise ValueError("linear_layer_indices contains an invalid layer index")
+        if num_key_value_heads < 1 or num_attention_heads % num_key_value_heads != 0:
+            raise ValueError("num_key_value_heads must divide num_attention_heads (GQA groups)")
         if num_attention_heads * head_dim != hidden_size:
             raise ValueError("hidden_size must equal num_attention_heads * head_dim")
         if q_lora_rank < 0 or kv_lora_rank <= 0:
@@ -102,6 +106,7 @@ class GatedMLAHybridConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.num_heads = num_attention_heads
+        self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
         self.intermediate_size = intermediate_size
         self.baseline = baseline

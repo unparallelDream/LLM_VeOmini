@@ -37,6 +37,8 @@ for line in sys.stdin:
     elif line.startswith('Only in $SRC_NAME'):
         rest = line[len('Only in $SRC_NAME/'):]
         d, n = rest.rsplit(': ', 1)
+        if d + '/' + n in EXCLUDES:
+            print('SKIP(excluded)', d + '/' + n); continue
         dst_path = os.path.join('$(basename "$DST")', d, n)
         if os.path.exists(dst_path):
             print('SKIP(exists)', d + '/' + n); continue

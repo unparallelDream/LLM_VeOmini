@@ -18,6 +18,8 @@ LLM_VeOmni/
 │   │   └── modeling_gated_mla_hybrid.py        # 建模：GatedMLA/SWA/HiLS占位/KDA 注意力
 │   │                                           #   + IdentityHyperConnection / ManifoldHyperConnection
 │   │                                           #   + MoEFFN(top-k路由+负载均衡损失) + DynamicCache 协议适配
+│   ├── GatedGQAHybrid/              # ★ GQA 变体家族（model_type gated_gqa_hybrid；薄子类复用
+│   │                                #   家族机制，baseline 固定 gated_gqa，KV=分组全维）
 │   ├── FlashHiLS/                   # 上游：HiLS 注意力（qwen/olmo 两个 modeling + hils_forward）
 │   ├── MASSIndex/                   # 上游：MASS 多锚检索（mass_attention/mass_retrieval 内核接口）
 │   ├── FullAttn/ NSA/ DASHATTN/ HSA_Ultralong/ INFLLMV2/   # 上游：对照模型族

@@ -1,8 +1,8 @@
 {
   "architectures": [
-    "GatedMLAHybridForCausalLM"
+    "GatedGQAHybridForCausalLM"
   ],
-  "model_type": "gated_mla_hybrid",
+  "model_type": "gated_gqa_hybrid",
   "vocab_size": 32000,
   "hidden_size": 384,
   "num_hidden_layers": 16,

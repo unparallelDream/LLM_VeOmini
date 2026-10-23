@@ -31,7 +31,9 @@ LLM_VeOmni/
 │   │   ├── gated_mla_{150m,400m,1b,1p8b}.json      # 密集扩展四档
 │   │   ├── gated_mla_{150m,400m,1b}_moe*.json      # MoE（E8 默认 / _e10 / _e16）
 │   │   └── kda_gated_mla_{50m,150m}_moe.json       # KDA×MoE 组合
-│   │   └── llama32k_tokenizer/      # 32K 词表 tokenizer
+│   │   └── llama32k_tokenizer/      # 32K 词表 tokenizer（家族共用）
+│   ├── gated_gqa_hybrid/           # ★ GQA 基线（gated_gqa_50m 6Q/2KV + _kv3 消融档；
+│   │                               #   Qwen3.8-FN/MiniMax-M3 式配置，与 MLA 对照）
 │   ├── mass_attention/ hils_attention/ naive_bsa/ nsa/ ...   # 上游各模型族配置
 │   ├── training_recipes/            # VeOmni 训练 recipe YAML（fsdp2 等正式配方）
 │   └── archive_qwen_small_scale/ olmo3_200M_cpt/ olmo3_7B/ olmo3_vocab/ ...

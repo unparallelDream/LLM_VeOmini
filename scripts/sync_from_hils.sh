@@ -21,6 +21,8 @@ diff -rq "$SRC_NAME" "$(basename "$DST")" \
   --exclude=tmp --exclude=outputs --exclude=logs --exclude=.cache 2>/dev/null | python3 -c "
 import sys, os, shutil
 dry = '$DRY' == '--dry-run'
+# 本仓库决定不复保留的上游目录（2026-10-20 删除 archive_qwen_small_scale）
+EXCLUDES = {'configs/archive_qwen_small_scale'}
 for line in sys.stdin:
     line = line.strip()
     if line.startswith('Files '):
@@ -28,7 +30,7 @@ for line in sys.stdin:
         a = line.split(' and ')[0]
         a = a[len('Files '):].split(' and ')[0]
         a = os.path.relpath(a, '$SRC_NAME')
-        if a in ('models/__init__.py', '.gitignore'):  # 本仓库两侧各自维护的文件
+        if a in ('models/__init__.py', '.gitignore', 'README.md'):  # 本仓库自维护（README 已重写为项目结构说明）
             print('SKIP(ours)', a); continue
         print('UPD', a)
         if not dry: shutil.copy(os.path.join('$SRC_NAME', a), os.path.join('$(basename "$DST")', a))

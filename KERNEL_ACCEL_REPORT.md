@@ -198,3 +198,53 @@ python scripts_zem/analyze_kernel_trace.py outputs/olmo7b_mass_kernel_profile/tr
 三项修复(dq GEMM、partial 修复+合并、hils bwd 线程)对 200M **自动生效**(共享同一份 ops 代码,无需改配置)。
 
 **影响面**:已完成的 200M CPT(15000 步,final recipe)自始至终带着被污染的 dmu/dbias 梯度训练(锚生成器/landmark key 路径);dq 路径与 LM 主干梯度正常。当前在跑的 lmeval 200M 评测是纯推理(is_training=False,不走 backward),不受影响。是否用修复后 kernel 重训 200M 由实验决定。
+
+---
+
+# 补充(2026-10-19 发现/修复): envelope/selected_scores kernel 的 T.serial 累积降低 bug
+
+## 症状
+
+`mass_envelope_candidates_kernel` 中 `for l, nn in T.Parallel(block_l, block_n)` 区内,
+`for m in T.serial(mp)` 对 `group_max/exp_sum`(T.alloc_local 标量)的累积**没有正确 lower**:
+M≥2 时 max 与 LSE 两种归约模式都静默退化为"仅取 m=mp-1 平面",不报错、无 NaN。
+
+## 发现与实锤(2026-10-19)
+
+- 数值对拍(生产形状 H=4/M=2,独立 torch 参考): 旧 kernel 输出与"仅末视图"**逐位一致**
+  (maxdiff=0.0000),与正确参考差 ~3.7;
+- 修复版(Python 展开 mp 循环)与参考**精确一致**;
+- 历史分层单测(candidates/topk 在 H=32 与 H=4 互检 100% 一致)为何漏检: 两个 kernel
+  同样塌缩 → 同错 → 互检必然一致。**教训: kernel 正确性必须对独立参考,不能 kernel-vs-kernel**。
+
+## 根因与波及面
+
+- tilelang free-mode 布局推断对 `T.Parallel` 区内 `T.serial` 循环累积 alloc_local 标量的
+  lowering 缺陷(与 10-10 两段式 partial 的布局 bug 同类);
+- **第二个同构病灶**: `mass_selected_scores_kernel`(backward 路由分数重算)双层中招——
+  `T.serial(M)` 与内层 `T.serial(D)` 点积均塌缩(仅展开 m 后仍差 1.62,展开 d 后归零),
+  即训练梯度的分数路径同样被污染;
+- **影响定性(关键)**: wrapper 把 HiLS 共享键放 view 0、专用锚占 view 1..M-1,塌缩取
+  m=M-1 ⇒ **所有 mass 臂的 prefill 块选择从未用过 HiLS 预训练底座,只用最后一个专用锚
+  视图**——历次 mass 训练/评测实际运行"单视图退化 MASS"。decode 路径(_decode_retrieval
+  参考数学)一直是正确的 M+1 视图 ⇒ prefill/decode 选择标准长期不一致。
+- **受影响 run**: mass buggy、mass new(12d3e46)、cont10B 两段(至 47500)、期间全部评测。
+  hils/recover 不经过该 kernel,零影响。
+
+## 对历史结论的修订(详见 EVAL_200M_FIVEWAY_20261014.md 命名勘误)
+
+- "old-mass ≈ hils 变体(shared view 主导)"不成立——old-mass 选择同样是(随机)单视图;
+- mass@16K essay(single_2=0.02-0.04) vs hils(0.50)的塌方获得更直接解释: mass 从未把
+  共享键用于 prefill 选择;
+- "双锚 MoE 有效"从未被真正测过——mass-vs-hils 的数据效率优势是在单视图残障下取得的。
+
+## 修复与防回归
+
+- `b5e8a0a`: envelope mp 循环 + selected_scores 双层(M/D)循环全部 Python 展开;新增
+  `unittests/test_mass_envelope_reference.py`(kernel vs 独立参考,M=2/4/8 × max/LSE 全绿);
+- `4bf0019`: M=4/M=8 形状验证(精确一致);已知限制: 奇数 mp(M=3)被 tilelang 布局推断
+  拒绝("no available layout found"),支持面=偶数/2 幂;
+- 修复版续训: `olmo200m_mass_cont10B_fixkernel`(从 47500 步无缝续,GPU3)——项目第一次
+  训练"真正的双视图 MASS";
+- 规则: 本仓 TileLang kernel 内**禁止** `T.Parallel` 区中 `T.serial` 循环累积
+  alloc_local 标量;一律 Python 展开并配独立参考单测。

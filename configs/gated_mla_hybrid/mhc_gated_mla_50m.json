@@ -41,5 +41,6 @@
   "mhc_num_streams": 4,
   "mhc_alpha_init": 0.01,
   "mhc_sinkhorn_iters": 20,
-  "mhc_res_bias_init": 0.0
+  "mhc_res_bias_init": 0.0,
+  "sink_style": "first_tokens"
 }

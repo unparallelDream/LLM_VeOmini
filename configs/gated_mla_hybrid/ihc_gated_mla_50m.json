@@ -39,5 +39,6 @@
   "bos_token_id": 1,
   "eos_token_id": 2,
   "ihc_num_streams": 4,
-  "ihc_alpha_init": 0.01
+  "ihc_alpha_init": 0.01,
+  "sink_style": "first_tokens"
 }

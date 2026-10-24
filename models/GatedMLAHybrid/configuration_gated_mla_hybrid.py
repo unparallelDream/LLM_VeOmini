@@ -37,6 +37,11 @@ class GatedMLAHybridConfig(PretrainedConfig):
         use_nope_mla: bool = False,
         attention_sink: bool = True,
         attention_sink_size: int = 1,
+        # sink mechanism when attention_sink=True: "virtual" (gpt-oss style,
+        # per-head learnable logit in the softmax denominator -- family default),
+        # "first_tokens" (legacy StreamingLLM style: first attention_sink_size
+        # REAL tokens bypass the window with an additive bias), "none".
+        sink_style: str = "virtual",
         window_size: int = 128,
         output_gate_type: str = "vector",
         output_gate_init: float = -2.0,
@@ -90,6 +95,10 @@ class GatedMLAHybridConfig(PretrainedConfig):
             raise ValueError("Only swiglu channel mixer is currently supported")
         if attention_sink_size < 0:
             raise ValueError("attention_sink_size must be non-negative")
+        if sink_style not in {"virtual", "first_tokens", "none"}:
+            raise ValueError("sink_style must be one of virtual/first_tokens/none")
+        if sink_style == "none":
+            attention_sink = False
         if window_size < 1:
             raise ValueError("window_size must be positive")
         if use_mhc and use_ihc:
@@ -119,6 +128,7 @@ class GatedMLAHybridConfig(PretrainedConfig):
         self.use_nope_mla = use_nope_mla
         self.attention_sink = attention_sink
         self.attention_sink_size = attention_sink_size
+        self.sink_style = sink_style if attention_sink else "none"
         self.window_size = window_size
         self.output_gate_type = output_gate_type
         self.output_gate_init = output_gate_init

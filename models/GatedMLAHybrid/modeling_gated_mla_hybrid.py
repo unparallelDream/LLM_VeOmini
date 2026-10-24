@@ -348,7 +348,17 @@ class GQAAttention(nn.Module):
         self.rope_dim = config.qk_rope_head_dim
         self.rope_theta = config.rope_theta
         self.window_size = config.window_size
-        self.sink_size = config.attention_sink_size if config.attention_sink else 0
+        self.sink_style = config.sink_style if config.attention_sink else "none"
+        self.sink_size = (
+            config.attention_sink_size
+            if config.attention_sink and self.sink_style == "first_tokens"
+            else 0
+        )
+        # gpt-oss style virtual sink: per-head learnable logit entering the
+        # softmax denominator via a zero-k/v virtual column
+        self.virtual_sink_logit = (
+            nn.Parameter(torch.zeros(self.num_heads)) if self.sink_style == "virtual" else None
+        )
         d = config.hidden_size
         self.q_proj = nn.Linear(d, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(d, self.num_kv_heads * self.head_dim, bias=False)
@@ -377,6 +387,26 @@ class GQAAttention(nn.Module):
             from torch.nn.attention.flex_attention import flex_attention as _fa
             self._flex_fn = torch.compile(_fa, dynamic=False)
 
+    def _virtual_sink_attention(self, q_t, k, v, device) -> torch.Tensor:
+        """gpt-oss style virtual sink, exact math via a zero-k/v virtual column.
+
+        Appending one KV column with k=v=0 and an additive per-head logit \beta_h
+        makes softmax see [beta_h, real scores]: the column adds exp(beta_h) to
+        the denominator and zero to the numerator -- precisely the learnable
+        attention sink. Fully differentiable (beta enters through attn_mask).
+        """
+        S = q_t.shape[2]
+        H, KVH, D = self.num_heads, self.num_kv_heads, q_t.shape[-1]
+        zeros_kv = q_t.new_zeros(q_t.shape[0], KVH, 1, D)
+        k_v = torch.cat((k, zeros_kv), dim=2)[:, self.kv_group]
+        v_v = torch.cat((v, zeros_kv), dim=2)[:, self.kv_group]
+        base = _attention_bias(S, S, device, q_t.dtype, self.window_size, 0, None, None)
+        base = torch.nn.functional.pad(base, (0, 1))  # virtual col: allowed, bias 0
+        beta_col = q_t.new_zeros(1, H, 1, S + 1)
+        beta_col[..., -1:] = self.virtual_sink_logit.view(1, H, 1, 1).to(q_t.dtype)
+        mask = base + beta_col  # [1,H,S,S+1]
+        return F.scaled_dot_product_attention(q_t, k_v, v_v, attn_mask=mask, dropout_p=0.0, is_causal=False)
+
     def _flex_forward(self, q_t: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Block-sparse attention via flex_attention (compiled).
 
@@ -387,29 +417,43 @@ class GQAAttention(nn.Module):
 
         S = q_t.shape[2]
         window, sink = self.window_size, self.sink_size
-        if self._flex_block_mask is None or self._flex_block_mask.shape[0] != S:
+        virtual = self.sink_style == "virtual"
+        if virtual:
+            # one extra always-visible virtual column carries beta_h
+            from torch.nn.attention.flex_attention import create_block_mask as _cbm  # noqa
+        total_S = S + 1 if virtual else S
+        if self._flex_block_mask is None or self._flex_block_mask.shape[0] != total_S:
             def mask_mod(b, h, q_idx, kv_idx):
+                if virtual and kv_idx == S:
+                    return True
                 causal = q_idx >= kv_idx
                 local = q_idx - kv_idx < window
                 sinkc = kv_idx < sink
                 return causal & (local | sinkc)
 
             self._flex_block_mask = create_block_mask(
-                mask_mod, None, None, S, S, device=q_t.device
+                mask_mod, None, None, S, total_S, device=q_t.device
             )
         sink_logits = (
             self.sink_logits
             if self.sink_logits is not None
             else torch.zeros(1, device=q_t.device, dtype=q_t.dtype)
         )
+        beta = self.virtual_sink_logit if virtual else None
 
         def score_mod(score, b, h, q_idx, kv_idx):
+            if virtual and kv_idx == S:
+                return score + beta[h].to(score.dtype)
             return score + torch.where(
                 kv_idx < sink,
                 sink_logits[kv_idx].to(score.dtype),
                 torch.zeros((), device=score.device, dtype=score.dtype),
             )
 
+        if virtual:
+            zeros_kv = q_t.new_zeros(q_t.shape[0], k.shape[1], 1, k.shape[-1])
+            k = torch.cat((k, zeros_kv), dim=2)
+            v = torch.cat((v, zeros_kv), dim=2)
         return self._flex_fn(q_t, k, v, score_mod=score_mod, block_mask=self._flex_block_mask, enable_gqa=True)
 
     def _rope_tables(self, kv_len: int, dtype: torch.dtype):
@@ -481,6 +525,8 @@ class GQAAttention(nn.Module):
         q_t = q.transpose(1, 2)
         if self.attn_backend == "flex" and q_len == k.shape[2] and attention_mask is None:
             output = self._flex_forward(q_t, k, v)
+        elif self.sink_style == "virtual" and attention_mask is None:
+            output = self._virtual_sink_attention(q_t, k, v, hidden_states.device)
         else:
             mask = _attention_bias(
                 q_len,

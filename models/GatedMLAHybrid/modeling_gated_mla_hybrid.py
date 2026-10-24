@@ -375,13 +375,13 @@ class GQAAttention(nn.Module):
         # RoPE cos/sin cache: computed once per (kv_len, dtype) -- avoids the
         # eager inv_freq/einsum/cat chain on every forward.
         self._rope_cache: tuple = ()  # (kv_len, dtype-tok, cos, sin)
-        # attention backend: "sdpa" (dense additive mask, default) or "flex"
-        # (block-sparse causal&window|sink; the flex call is compiled once --
-        # flex in eager is a slow fallback by design). flex covers the exact
-        # family mask semantics incl. learned sink logits via score_mod;
-        # flash_attn pkg was ruled out because it cannot express the sink.
+        # attention backend (GQA_ATTN_BACKEND overrides): "flash" is the
+        # DEFAULT -- official flash_attn kernel, exact for sink_style="none"
+        # (causal+window maps 1:1; 3.7x at S8K vs sdpa). Configs carrying a
+        # sink (virtual/first_tokens) or incremental decode automatically
+        # fall through to "sdpa"; "flex" remains the long-seq + sink option.
         import os as _os
-        self.attn_backend = _os.environ.get("GQA_ATTN_BACKEND", "sdpa")
+        self.attn_backend = _os.environ.get("GQA_ATTN_BACKEND", "flash")
         self._flex_block_mask = None
         if self.attn_backend == "flex":
             from torch.nn.attention.flex_attention import flex_attention as _fa
@@ -528,6 +528,7 @@ class GQAAttention(nn.Module):
             and self.sink_style == "none"
             and q_len == k.shape[2]
             and attention_mask is None
+            and q_t.is_cuda  # flash_attn kernels are CUDA-only
         ):
             # no-sink semantics map EXACTLY onto official flash_attn:
             # causal & window == causal=True + window_size=(window-1, 0);

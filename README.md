@@ -62,6 +62,7 @@ LLM_VeOmni/
 ├── utils/                           # 冻结参数、参数组、trainable checkpointer 等训练工具
 ├── data/ preprocess/                # veomni 数据管线代码与预处理
 ├── results/ assets/                 # 结果与图示
+├── TRAINING_GUIDE.md                # ★ 训练配置与新模型注册指南（四层配置/注册模板/验证清单）
 ├── train.sh / train_dist.sh         # torchrun 启动器（单机/多机）
 ├── pyproject.toml / uv.lock / requirements.txt     # 依赖声明
 ├── outputs logs .cache              # → 本机共享资产软链（已 gitignore，不进版本库）
@@ -93,5 +94,6 @@ bash scripts/sync_from_hils.sh --dry-run   # 预览差异
 bash scripts/sync_from_hils.sh             # 拉入更新/新增，同步删除；豁免本仓库自维护文件
 ```
 
+配套文档：**[TRAINING_GUIDE.md](TRAINING_GUIDE.md)**（训练配置四层模型、新模型注册两种路线、验证清单、已知约束）；
 扩展线的机制细节、扩展配置表、每专家参数、显存预算与路线图见
 **[docs_experiments/MODEL_SCALING_AND_MOE_GUIDE_20261019.md](docs_experiments/MODEL_SCALING_AND_MOE_GUIDE_20261019.md)**。

@@ -806,6 +806,7 @@ class HybridBlock(nn.Module):
             self.attn = GatedMLA(config)
         self.mlp = MoEFFN(config) if config.num_experts > 1 else SwiGLU(config)
         self.layer_idx = layer_idx
+        self.gradient_checkpointing = False  # HF checkpointing protocol flag
         self.use_ihc = config.use_ihc
         self.use_mhc = config.use_mhc
         if self.use_ihc:
@@ -853,6 +854,7 @@ class GatedMLAHybridPreTrainedModel(PreTrainedModel):
     config_class = GatedMLAHybridConfig
     base_model_prefix = "model"
     _no_split_modules = ["HybridBlock"]
+    supports_gradient_checkpointing = True
     # generate() passes a DynamicCache; forward accepts it via recompute mode
     _supports_cache_class = True
     # Porting note (VeOmni): attention runs through
@@ -875,6 +877,7 @@ class GatedMLAHybridModel(GatedMLAHybridPreTrainedModel):
         self.layers = nn.ModuleList(
             [HybridBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
+        self.gradient_checkpointing = False  # HF checkpointing protocol flag
         self.norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.use_ihc = config.use_ihc
         self.use_mhc = config.use_mhc
@@ -955,22 +958,20 @@ class GatedMLAHybridModel(GatedMLAHybridPreTrainedModel):
             # Cache objects from generate() are not consumed (recompute mode);
             # legacy tuple caches keep the original incremental protocol.
             layer_past = None if (past_key_values is None or cache_input) else past_key_values[layer_idx]
-            if self.use_hc:
-                X, layer_cache = layer.forward_streams(
-                    X,
-                    past_key_value=layer_past,
-                    use_cache=use_cache,
-                    position_ids=position_ids,
-                    **kwargs,
-                )
+
+            def _run_layer(_h, _layer=layer, _past=layer_past):
+                _fn = _layer.forward_streams if self.use_hc else _layer
+                return _fn(_h, past_key_value=_past, use_cache=use_cache, position_ids=position_ids, **kwargs)
+
+            if self.gradient_checkpointing and self.training:
+                if self.use_hc:
+                    X, layer_cache = self._gradient_checkpointing_func(_run_layer, X)
+                else:
+                    hidden_states, layer_cache = self._gradient_checkpointing_func(_run_layer, hidden_states)
+            elif self.use_hc:
+                X, layer_cache = _run_layer(X)
             else:
-                hidden_states, layer_cache = layer(
-                    hidden_states,
-                    past_key_value=layer_past,
-                    use_cache=use_cache,
-                    position_ids=position_ids,
-                    **kwargs,
-                )
+                hidden_states, layer_cache = _run_layer(hidden_states)
             if use_cache:
                 next_cache.append(layer_cache)
         if self.use_hc:

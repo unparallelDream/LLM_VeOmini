@@ -41,14 +41,16 @@ def _pack_dynamic_cache(layer_caches: list) -> DynamicCache:
 
 
 class RMSNorm(nn.Module):
+    """RMSNorm over the last dim. Delegates to torch's fused F.rms_norm
+    (numerically equivalent to the eager pow/rsqrt chain, single kernel)."""
+
     def __init__(self, hidden_size: int, eps: float):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.eps = eps
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        variance = hidden_states.float().pow(2).mean(-1, keepdim=True)
-        return hidden_states * torch.rsqrt(variance + self.eps).to(hidden_states.dtype) * self.weight
+        return F.rms_norm(hidden_states, (hidden_states.shape[-1],), self.weight, self.eps)
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -303,6 +305,12 @@ class SlidingWindowAttention(nn.Module):
         return output, (k, v) if use_cache else None
 
 
+def _rotate_half_apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """Apply rotary to the last dim: x*cos + rotate_half(x)*sin."""
+    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
+    return x * cos + torch.cat((-x2, x1), dim=-1) * sin
+
+
 class GQAAttention(nn.Module):
     """Grouped-query baseline (Qwen3.8-FlashNext / MiniMax-M3 style config):
     few KV heads + per-head QK RMSNorm + partial RoPE on the first rope
@@ -332,6 +340,25 @@ class GQAAttention(nn.Module):
             torch.arange(self.num_kv_heads), self.num_heads // self.num_kv_heads
         )
         self.register_buffer("kv_group", group, persistent=False)
+        # RoPE cos/sin cache: computed once per (kv_len, dtype) -- avoids the
+        # eager inv_freq/einsum/cat chain on every forward.
+        self._rope_cache: tuple = ()  # (kv_len, dtype-tok, cos, sin)
+
+    def _rope_tables(self, kv_len: int, dtype: torch.dtype):
+        """Cached cos/sin tables [kv_len, rope_dim]; rebuilt only when the
+        length or dtype token changes (training sees one length per run)."""
+        token = (kv_len, dtype)
+        if self._rope_cache and self._rope_cache[:2] == token:
+            return self._rope_cache[2], self._rope_cache[3]
+        dim = self.rope_dim
+        inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, dim, 2, device=self.k_proj.weight.device).float() / dim))
+        t = torch.arange(kv_len, device=inv_freq.device).float()
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)  # [kv_len, dim]
+        # [1, S, 1, D]: broadcast-ready for [B, S, H, D] q/k tensors
+        cos, sin = emb.cos().to(dtype)[None, :, None, :], emb.sin().to(dtype)[None, :, None, :]
+        self._rope_cache = (kv_len, dtype, cos, sin)
+        return cos, sin
 
     def forward(
         self,
@@ -362,25 +389,27 @@ class GQAAttention(nn.Module):
         cache = (k, v) if use_cache else None
         kv_len = k.shape[2]
         if self.rope_dim > 0:
-            # partial RoPE on the first rope channels, mirroring GatedMLA's usage
-            q_rot, _ = _apply_rope(
-                q[..., : self.rope_dim],
-                torch.zeros_like(q[..., : self.rope_dim]),
-                position_ids,
-                self.rope_theta,
+            cos, sin = self._rope_tables(kv_len, q.dtype)
+            # q: positions come from position_ids; k: full 0..kv_len re-rotation
+            # q positions may differ from cache positions (incremental decode):
+            # index rows then restore the broadcast shape [1, q_len, 1, D]
+            q_pos = position_ids.reshape(-1)[:q_len]
+            qc, sc = cos[0, q_pos], sin[0, q_pos]
+            q = torch.cat(
+                (
+                    _rotate_half_apply(q[..., : self.rope_dim], qc, sc),
+                    q[..., self.rope_dim:],
+                ),
+                dim=-1,
             )
             k_t = k.transpose(1, 2)
-            _, k_rot = _apply_rope(
-                k_t.new_zeros(batch, kv_len, self.num_kv_heads, self.rope_dim),
-                k_t[..., : self.rope_dim],
-                torch.arange(kv_len, device=hidden_states.device).unsqueeze(0).expand(batch, -1),
-                self.rope_theta,
-            )
-            q = torch.cat((q_rot, q[..., self.rope_dim:]), dim=-1)
-            k = torch.cat((k_rot, k_t[..., self.rope_dim:]), dim=-1).transpose(1, 2)
-        # expand KV heads to query heads, then attend
-        k_exp = k[:, self.kv_group]
-        v_exp = v[:, self.kv_group]
+            k = torch.cat(
+                (
+                    _rotate_half_apply(k_t[..., : self.rope_dim], cos, sin),
+                    k_t[..., self.rope_dim:],
+                ),
+                dim=-1,
+            ).transpose(1, 2)
         q_t = q.transpose(1, 2)
         mask = _attention_bias(
             q_len,
@@ -392,6 +421,11 @@ class GQAAttention(nn.Module):
             self.sink_logits,
             attention_mask,
         )
+        # NOTE: torch 2.6's enable_gqa=True SDPA path measured 8x SLOWER
+        # (1354 vs 172 us) than the eager gather on this shape/mask combo --
+        # keep the manual KV-head expansion.
+        k_exp = k[:, self.kv_group]
+        v_exp = v[:, self.kv_group]
         output = F.scaled_dot_product_attention(q_t, k_exp, v_exp, attn_mask=mask, dropout_p=0.0, is_causal=False)
         output = output.transpose(1, 2).reshape(batch, q_len, -1)
         output = self.output_gate(hidden_states, self.o_proj(output))

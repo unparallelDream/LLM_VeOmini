@@ -62,7 +62,6 @@ LLM_VeOmni/
 ├── utils/                           # 冻结参数、参数组、trainable checkpointer 等训练工具
 ├── data/ preprocess/                # veomni 数据管线代码与预处理
 ├── results/ assets/                 # 结果与图示
-├── PROGRESS_*.md / KERNEL_ACCEL_REPORT.md          # 上游进度与内核加速报告
 ├── train.sh / train_dist.sh         # torchrun 启动器（单机/多机）
 ├── pyproject.toml / uv.lock / requirements.txt     # 依赖声明
 ├── outputs logs .cache              # → 本机共享资产软链（已 gitignore，不进版本库）

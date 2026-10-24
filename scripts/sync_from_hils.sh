@@ -22,7 +22,7 @@ diff -rq "$SRC_NAME" "$(basename "$DST")" \
 import sys, os, shutil
 dry = '$DRY' == '--dry-run'
 # 本仓库决定不复保留的上游目录（2026-10-20 删除 archive_qwen_small_scale）
-EXCLUDES = {'configs/archive_qwen_small_scale'}
+EXCLUDES = {'configs/archive_qwen_small_scale', 'KERNEL_ACCEL_REPORT.md', 'PROGRESS_20261007.md', 'PROGRESS_20261009.md'}
 for line in sys.stdin:
     line = line.strip()
     if line.startswith('Files '):
@@ -35,17 +35,19 @@ for line in sys.stdin:
         print('UPD', a)
         if not dry: shutil.copy(os.path.join('$SRC_NAME', a), os.path.join('$(basename "$DST")', a))
     elif line.startswith('Only in $SRC_NAME'):
-        rest = line[len('Only in $SRC_NAME/'):]
-        d, n = rest.rsplit(': ', 1)
-        if d + '/' + n in EXCLUDES:
-            print('SKIP(excluded)', d + '/' + n); continue
-        dst_path = os.path.join('$(basename "$DST")', d, n)
+        body = line[len('Only in $SRC_NAME'):].strip()
+        d, _, n = body.partition(': ')
+        d = d or '.'
+        rel = n if d == '.' else d + '/' + n
+        if rel in EXCLUDES:
+            print('SKIP(excluded)', rel); continue
+        dst_path = os.path.join('$(basename "$DST")', rel)
         if os.path.exists(dst_path):
-            print('SKIP(exists)', d + '/' + n); continue
-        print('NEW', d + '/' + n)
+            print('SKIP(exists)', rel); continue
+        print('NEW', rel)
         if not dry:
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            s = os.path.join('$SRC_NAME', d, n)
+            s = os.path.join('$SRC_NAME', rel)
             shutil.copytree(s, dst_path, dirs_exist_ok=True) if os.path.isdir(s) else shutil.copy(s, dst_path)
 "
 cd "$SRC"

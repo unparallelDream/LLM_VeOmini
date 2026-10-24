@@ -219,6 +219,23 @@ def main():
     model_config = model.config
     helper.print_device_mem_info("VRAM usage after building model")
 
+    if os.environ.get("GATED_COMPILE", "0") == "1":
+        # Compile only the attention submodules (before DDP wrapping): the
+        # eager chain inside each attn (norm/rope/mask assembly) is the
+        # measured hotspot (GQAAttention 1054->439us). Submodule-level compile
+        # keeps DDP/DCP semantics untouched -- the wrappers still see plain
+        # nn.Module boundaries. One-time ~40s/layer-set cost; recompiles are
+        # cached by shape (dynamic=False with fixed packing lengths).
+        import time as _t
+        _c0 = _t.time()
+        n_compiled = 0
+        for block in model.model.layers:
+            block.attn = torch.compile(block.attn, dynamic=False)
+            n_compiled += 1
+        logger.info_rank0(
+            f"GATED_COMPILE=1: compiled {n_compiled} attention submodules in {_t.time()-_c0:.0f}s (lazy: first steps build graphs)"
+        )
+
     get_optimizer_pre_hook = getattr(model, "get_optimizer_pre_hook", None)
     parallel_mixed_precision = args.train.enable_mixed_precision and not pure_bf16
     model = build_parallelize_model(

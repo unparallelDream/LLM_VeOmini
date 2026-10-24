@@ -118,13 +118,23 @@ def _attention_bias(
             )
         valid = valid.unsqueeze(0) & key_padding_mask.to(torch.bool)[:, None, :]
         batch_size = key_padding_mask.shape[0]
+        bias = torch.zeros((batch_size, 1, q_len, kv_len), device=device, dtype=dtype)
+        bias.masked_fill_(~valid.unsqueeze(1), torch.finfo(dtype).min)
     else:
-        valid = valid.view(1, q_len, kv_len)
+        # no per-example padding (packed training): the additive bias depends
+        # only on (shape, dtype) -- cache the zeros/min assembly, same as the
+        # boolean grid, so 16 layers x every step stop rebuilding [1,1,S,S].
+        cache_key = (q_len, kv_len, dtype, str(device))
+        bias = _MASK_CACHE.get(("bias",) + cache_key)
+        if bias is None:
+            bias = torch.zeros((1, 1, q_len, kv_len), device=device, dtype=dtype)
+            bias.masked_fill_(~valid.view(1, 1, q_len, kv_len), torch.finfo(dtype).min)
+            _MASK_CACHE[("bias",) + cache_key] = bias
         batch_size = 1
-    bias = torch.zeros((batch_size, 1, q_len, kv_len), device=device, dtype=dtype)
-    bias.masked_fill_(~valid.unsqueeze(1), torch.finfo(dtype).min)
     if sink_logits is not None and sink_size:
         if sink_logits.ndim == 1:
+            # the base bias may be cache-shared: never mutate it in place
+            bias = bias.clone()
             bias[..., :sink_size] += sink_logits.to(dtype).view(1, 1, 1, sink_size)
         else:
             bias = bias.expand(batch_size, sink_logits.shape[0], q_len, kv_len).clone()

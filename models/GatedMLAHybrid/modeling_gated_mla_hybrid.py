@@ -365,6 +365,52 @@ class GQAAttention(nn.Module):
         # RoPE cos/sin cache: computed once per (kv_len, dtype) -- avoids the
         # eager inv_freq/einsum/cat chain on every forward.
         self._rope_cache: tuple = ()  # (kv_len, dtype-tok, cos, sin)
+        # attention backend: "sdpa" (dense additive mask, default) or "flex"
+        # (block-sparse causal&window|sink; the flex call is compiled once --
+        # flex in eager is a slow fallback by design). flex covers the exact
+        # family mask semantics incl. learned sink logits via score_mod;
+        # flash_attn pkg was ruled out because it cannot express the sink.
+        import os as _os
+        self.attn_backend = _os.environ.get("GQA_ATTN_BACKEND", "sdpa")
+        self._flex_block_mask = None
+        if self.attn_backend == "flex":
+            from torch.nn.attention.flex_attention import flex_attention as _fa
+            self._flex_fn = torch.compile(_fa, dynamic=False)
+
+    def _flex_forward(self, q_t: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Block-sparse attention via flex_attention (compiled).
+
+        mask_mod encodes the family semantics causal & (window | sink); the
+        learned sink logits enter through score_mod so the math matches the
+        SDPA path exactly (up to kernel numerics)."""
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        S = q_t.shape[2]
+        window, sink = self.window_size, self.sink_size
+        if self._flex_block_mask is None or self._flex_block_mask.shape[0] != S:
+            def mask_mod(b, h, q_idx, kv_idx):
+                causal = q_idx >= kv_idx
+                local = q_idx - kv_idx < window
+                sinkc = kv_idx < sink
+                return causal & (local | sinkc)
+
+            self._flex_block_mask = create_block_mask(
+                mask_mod, None, None, S, S, device=q_t.device
+            )
+        sink_logits = (
+            self.sink_logits
+            if self.sink_logits is not None
+            else torch.zeros(1, device=q_t.device, dtype=q_t.dtype)
+        )
+
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return score + torch.where(
+                kv_idx < sink,
+                sink_logits[kv_idx].to(score.dtype),
+                torch.zeros((), device=score.device, dtype=score.dtype),
+            )
+
+        return self._flex_fn(q_t, k, v, score_mod=score_mod, block_mask=self._flex_block_mask, enable_gqa=True)
 
     def _rope_tables(self, kv_len: int, dtype: torch.dtype):
         """Cached cos/sin tables [kv_len, rope_dim]; rebuilt only when the
@@ -433,22 +479,25 @@ class GQAAttention(nn.Module):
                 dim=-1,
             ).transpose(1, 2)
         q_t = q.transpose(1, 2)
-        mask = _attention_bias(
-            q_len,
-            k.shape[2],
-            hidden_states.device,
-            q_t.dtype,
-            self.window_size,
-            self.sink_size,
-            self.sink_logits,
-            attention_mask,
-        )
-        # NOTE: torch 2.6's enable_gqa=True SDPA path measured 8x SLOWER
-        # (1354 vs 172 us) than the eager gather on this shape/mask combo --
-        # keep the manual KV-head expansion.
-        k_exp = k[:, self.kv_group]
-        v_exp = v[:, self.kv_group]
-        output = F.scaled_dot_product_attention(q_t, k_exp, v_exp, attn_mask=mask, dropout_p=0.0, is_causal=False)
+        if self.attn_backend == "flex" and q_len == k.shape[2] and attention_mask is None:
+            output = self._flex_forward(q_t, k, v)
+        else:
+            mask = _attention_bias(
+                q_len,
+                k.shape[2],
+                hidden_states.device,
+                q_t.dtype,
+                self.window_size,
+                self.sink_size,
+                self.sink_logits,
+                attention_mask,
+            )
+            # NOTE: torch 2.6's enable_gqa=True SDPA path measured 8x SLOWER
+            # (1354 vs 172 us) than the eager gather on this shape/mask combo --
+            # keep the manual KV-head expansion.
+            k_exp = k[:, self.kv_group]
+            v_exp = v[:, self.kv_group]
+            output = F.scaled_dot_product_attention(q_t, k_exp, v_exp, attn_mask=mask, dropout_p=0.0, is_causal=False)
         output = output.transpose(1, 2).reshape(batch, q_len, -1)
         output = self.output_gate(hidden_states, self.o_proj(output))
         return output, cache

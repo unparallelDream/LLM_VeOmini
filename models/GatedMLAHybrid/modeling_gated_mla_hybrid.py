@@ -72,6 +72,9 @@ def _apply_rope(
     return query * cos + _rotate_half(query) * sin, key * cos[:, :, :1] + _rotate_half(key) * sin[:, :, :1]
 
 
+_MASK_CACHE: dict = {}
+
+
 def _attention_mask(
     q_len: int,
     kv_len: int,
@@ -79,12 +82,21 @@ def _attention_mask(
     window_size: int,
     sink_size: int,
 ) -> torch.Tensor:
-    query_positions = torch.arange(kv_len - q_len, kv_len, device=device)[:, None]
-    key_positions = torch.arange(kv_len, device=device)[None, :]
-    causal = key_positions <= query_positions
-    local = key_positions > (query_positions - window_size)
-    sink = key_positions < sink_size
-    return causal & (local | sink)
+    """Boolean causal/local/sink pattern; cached per (shape, window, sink, device).
+
+    Training hits one (q_len == kv_len) shape for the whole run, so the
+    position-arithmetic grid is built once instead of every layer-step."""
+    key = (q_len, kv_len, window_size, sink_size, str(device))
+    m = _MASK_CACHE.get(key)
+    if m is None:
+        query_positions = torch.arange(kv_len - q_len, kv_len, device=device)[:, None]
+        key_positions = torch.arange(kv_len, device=device)[None, :]
+        causal = key_positions <= query_positions
+        local = key_positions > (query_positions - window_size)
+        sink = key_positions < sink_size
+        m = causal & (local | sink)
+        _MASK_CACHE[key] = m
+    return m
 
 
 def _attention_bias(

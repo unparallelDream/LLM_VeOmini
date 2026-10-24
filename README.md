@@ -83,6 +83,9 @@ GPU=4 CONFIG=... STEPS=500 WARMUP=0.03 SEED=42 SAVE_STEPS=500 bash scripts/gated
 
 # 单卡 fp32-master 路径（bf16 计算 + fp32 主权重）
 DP_MODE=ddp GATED_PURE_BF16=0 bash scripts/gated_mla_smoke.sh
+
+# 注意力后端（默认 flash：sink=none 时官方 FA 内核；详见 TRAINING_GUIDE）
+GQA_ATTN_BACKEND=flash|sdpa|flex bash scripts/gated_mla_smoke.sh
 ```
 
 ## 与上游的同步

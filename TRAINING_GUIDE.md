@@ -25,6 +25,8 @@
 | `WARMUP` | 0.5 | warmup 比例（正式跑改 0.03） |
 | `GATED_PURE_BF16` | 1 | 精度开关（**KDA 配置必须 =1**） |
 | `FLA_TILELANG` | 0 | fla 后端（**KDA 配置必须 =0**，本环境 tilelang 与 fla 不兼容） |
+| `GQA_ATTN_BACKEND` | **flash** | GQA 注意力后端：flash（官方 FA 内核，sink=none 时生效，S8K 实测 3.7×）/ sdpa（全 sink 态通用）/ flex（长序列+sink，块稀疏）。virtual/first_tokens/增量/CPU 自动回退 sdpa |
+| `GATED_COMPILE` | 0 | compile 注意力子模块（实测 50M@B4 稳态持平，当前规模不建议开） |
 
 ### 1.2 层 2 —— veomni 训练参数（脚本转译为 CLI）
 
@@ -44,7 +46,7 @@ qk_nope_head_dim + qk_rope_head_dim = head_dim
 num_attention_heads × v_head_dim = hidden_size        （GQA 家族另有：heads % num_key_value_heads == 0）
 ```
 
-**机制开关（可任意叠加）**：`baseline`（gated_mla / gated_gqa / swa / hils / kda + `linear_layer_indices` 线性层位置）、`use_ihc`/`use_mhc`（超连接）、`num_experts`（MoE，0=dense）、`num_key_value_heads`（GQA 族）。
+**机制开关（可任意叠加）**：`baseline`（gated_mla / gated_gqa / swa / hils / kda + `linear_layer_indices` 线性层位置）、`use_ihc`/`use_mhc`（超连接）、`num_experts`（MoE，0=dense）、`num_key_value_heads`（GQA 族）、**`sink_style`（sink 机制三态：`virtual`=gpt-oss 式每头可学习 β 进 softmax 分母【新默认，fp32 对照 1.9e-08】/ `first_tokens`=原 StreamingLLM 式首 token 突破窗口【存量 27 个 config 已固化此语义】/ `none`=无 sink，此时默认后端走官方 FA 内核）**。
 
 ### 1.4 层 4 —— 精度与并行路径（DP_MODE × GATED_PURE_BF16）
 
@@ -161,4 +163,6 @@ GPU=<空闲卡> CONFIG=configs/<族>/<新变体>.json bash scripts/gated_mla_smo
 | MoE 静态显存 | total 参数 × 6B（纯 bf16）/ ×16B（fp32 master）；1b_moe(3.46B) 需 80G 卡跑 fp32-master |
 | triton 升级 | 别动共享环境；需要时 clone 环境验证（hils 内核 + fla 都依赖当前版本） |
 | 生成评测 | 已修 DynamicCache 协议（recompute 模式）；SWA/KDA 层忽略 attention_mask → lm-eval 建议 batch_size=1 |
+| 注意力后端路由 | 默认 flash：sink=none+GPU+全长 → 官方 FA（S8K 3.7×，等价 0.0002）；带 sink/增量/CPU → 自动 sdpa；flex=长序列+sink 选项。MagiAttention 组合层 vendored 仅供基准（官方 FA 上输出不正确，勿用于模型） |
+| sink 语义 | 新默认 virtual（每头 β）；历史 config 已固化 first_tokens；500 步消融：ON 均值持平且种子方差低 4 倍 |
 | 上游同步 | `bash scripts/sync_from_hils.sh [--dry-run]`；豁免：`models/__init__.py`、`.gitignore`、`README.md`；排除：archive_qwen_small_scale、三个已删上游 md |

@@ -51,8 +51,8 @@ CUDA_VISIBLE_DEVICES=$GPU "$PYTHON" -m torch.distributed.run \
     --train.init_device "$INIT_DEVICE" \
     --train.enable_full_shard "$ENABLE_FULL_SHARD" \
     --train.broadcast_model_weights_from_rank0 true \
-    --train.micro_batch_size 4 \
-    --train.global_batch_size 4 \
+    --train.micro_batch_size "${MICRO:-4}" \
+    --train.global_batch_size "${GLOBAL:-$MICRO}" \
     --train.max_steps "$STEPS" \
     --train.seed "${SEED:-42}" \
     --train.num_train_epochs 1 \

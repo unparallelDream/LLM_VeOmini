@@ -34,7 +34,7 @@ ENABLE_FULL_SHARD=${ENABLE_FULL_SHARD:-false}
 
 rm -rf "$OUT"
 CUDA_VISIBLE_DEVICES=$GPU "$PYTHON" -m torch.distributed.run \
-  --nnodes=1 --nproc-per-node=1 --node-rank=0 --standalone \
+  --nnodes=1 --nproc-per-node="${NPROC:-1}" --node-rank=0 --standalone \
   tasks/pretrain_gated.py \
     --model.config_path "$CONFIG" \
     --model.tokenizer_path "${TOKENIZER:-configs/gated_mla_hybrid/llama32k_tokenizer}" \

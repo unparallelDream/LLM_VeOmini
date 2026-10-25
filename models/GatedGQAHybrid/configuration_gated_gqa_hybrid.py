@@ -16,6 +16,7 @@ class GatedGQAHybridConfig(GatedMLAHybridConfig):
     architectures = ["GatedGQAHybridForCausalLM"]
 
     def __init__(self, baseline: str = "gated_gqa", **kwargs):
-        if baseline != "gated_gqa":
-            raise ValueError("GatedGQAHybridConfig fixes baseline='gated_gqa'")
-        super().__init__(baseline="gated_gqa", **kwargs)
+        # "kda_gated_gqa" = GQA with KDA at the linear layer positions
+        if baseline not in ("gated_gqa", "kda_gated_gqa"):
+            raise ValueError("GatedGQAHybridConfig fixes baseline to gated_gqa/kda_gated_gqa")
+        super().__init__(baseline=baseline, **kwargs)

@@ -794,7 +794,7 @@ class HybridBlock(nn.Module):
         self.attn_norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.mlp_norm = RMSNorm(config.hidden_size, config.norm_eps)
         if layer_idx in config.linear_layer_indices:
-            if config.baseline == "kda_gated_mla":
+            if config.baseline in ("kda_gated_mla", "kda_gated_gqa"):
                 self.attn = KDAAttention(config, layer_idx)
             elif config.baseline == "hils_gated_mla":
                 self.attn = HiLSAttention(config)

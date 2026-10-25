@@ -13,6 +13,7 @@ class GatedMLAHybridConfig(PretrainedConfig):
     BASELINES = {
         "gated_mla": (),
         "gated_gqa": (),
+        "kda_gated_gqa": (3, 7, 11, 15),
         "hils_gated_mla": (3, 7, 11, 15),
         "kda_gated_mla": (3, 7, 11, 15),
         "swa_gated_mla": (3, 7, 11, 15),
